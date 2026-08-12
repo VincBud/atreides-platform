@@ -29,6 +29,14 @@ class VideoSinkError(AtreidesVisionError):
     """Raised when a video sink cannot be created or written to."""
 
 
+class ZoneConfigurationError(AtreidesVisionError):
+    """Raised when a zone configuration file is missing, malformed or invalid."""
+
+
+class MetricsOutputError(AtreidesVisionError):
+    """Raised when the zone-metrics output stream cannot be created or written."""
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from atreides_vision.errors import ConfigurationError, DeviceUnavailableError
+from atreides_vision.zones.config import ZoneAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ __all__ = [
     "TrackerConfig",
     "VisionConfig",
     "VisualizationConfig",
+    "ZoneAnalysisConfig",
     "resolve_device",
 ]
 
@@ -198,6 +200,13 @@ class VisualizationConfig:
     box_thickness: int = 2
     trail_thickness: int = 2
     font_scale: float = 0.5
+    #: Draw zone polygons and their metric panels when zones are configured.
+    draw_zones: bool = True
+    #: Opacity of the tint filling a zone polygon. 0 draws outlines only.
+    zone_fill_alpha: float = 0.12
+    zone_outline_thickness: int = 2
+    #: Include cumulative entry/exit counts in each zone's panel.
+    draw_zone_counters: bool = True
 
     def __post_init__(self) -> None:
         if self.trail_length < 2:
@@ -206,6 +215,10 @@ class VisualizationConfig:
             raise ConfigurationError(f"trail_ttl_frames must be >= 1, got {self.trail_ttl_frames}")
         if self.max_trails < 1:
             raise ConfigurationError(f"max_trails must be >= 1, got {self.max_trails}")
+        if not 0.0 <= self.zone_fill_alpha <= 1.0:
+            raise ConfigurationError(
+                f"zone_fill_alpha must be in [0, 1], got {self.zone_fill_alpha}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,9 +243,15 @@ class PipelineConfig:
 
 @dataclass(frozen=True, slots=True)
 class VisionConfig:
-    """Complete configuration for one SEE + TRACK run."""
+    """Complete configuration for one run.
+
+    ``zones`` tunes zone analysis but does not enable it: zone processing runs
+    only when the pipeline is given a zone analyzer, which the CLI builds from
+    ``--zones``. Without it the run is plain V0.1 SEE + TRACK.
+    """
 
     pipeline: PipelineConfig
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
+    zones: ZoneAnalysisConfig = field(default_factory=ZoneAnalysisConfig)

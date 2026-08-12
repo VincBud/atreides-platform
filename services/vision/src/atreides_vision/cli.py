@@ -13,6 +13,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from contextlib import ExitStack
 from pathlib import Path
 
 from atreides_vision import __version__
@@ -23,14 +24,19 @@ from atreides_vision.config import (
     TrackerConfig,
     VisionConfig,
     VisualizationConfig,
+    ZoneAnalysisConfig,
     resolve_device,
 )
 from atreides_vision.detection.rfdetr import RFDetrPersonDetector
-from atreides_vision.errors import AtreidesVisionError
+from atreides_vision.errors import AtreidesVisionError, ConfigurationError
 from atreides_vision.tracking.bytetrack import ByteTrackTracker
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
 from atreides_vision.video.source import FileVideoSource, VideoMetadata
+from atreides_vision.zones.analyzer import ZoneAnalyzer
+from atreides_vision.zones.loader import load_zone_layout
+from atreides_vision.zones.models import ZoneLayout
+from atreides_vision.zones.reporting import JsonlMetricsWriter
 
 logger = logging.getLogger("atreides_vision")
 
@@ -99,6 +105,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process at most N frames. Useful for a quick check on a long video.",
     )
     run_parser.add_argument(
+        "--zones",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Zone configuration JSON (e.g. config/zones.example.json). "
+            "Omit it to run plain detection and tracking."
+        ),
+    )
+    run_parser.add_argument(
+        "--metrics-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write zone metrics as JSON Lines (e.g. artifacts/zone_metrics.jsonl). "
+            "Requires --zones."
+        ),
+    )
+    run_parser.add_argument(
+        "--metrics-interval",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Seconds of source time between metric records. Default: 1.0.",
+    )
+    run_parser.add_argument(
         "--trail-length",
         type=int,
         default=25,
@@ -139,6 +172,12 @@ def _configure_logging(verbose: bool) -> None:
 def _run_command(args: argparse.Namespace) -> int:
     _configure_logging(args.verbose)
 
+    if args.metrics_output is not None and args.zones is None:
+        raise ConfigurationError(
+            "--metrics-output needs zones to measure. Add --zones config/zones.example.json, "
+            "or drop --metrics-output."
+        )
+
     pipeline_config = PipelineConfig(
         input_path=args.input,
         output_path=args.output,
@@ -146,6 +185,9 @@ def _run_command(args: argparse.Namespace) -> int:
         log_every_n_frames=args.log_every,
     )
     device = resolve_device(args.device)
+
+    # Fail on a bad zone file before loading a detector or touching the video.
+    layout = None if args.zones is None else load_zone_layout(args.zones)
 
     with FileVideoSource(pipeline_config.input_path) as source:
         metadata = source.metadata
@@ -159,27 +201,46 @@ def _run_command(args: argparse.Namespace) -> int:
                 trail_length=args.trail_length,
                 draw_confidence=not args.no_confidence_labels,
             ),
+            zones=ZoneAnalysisConfig(
+                metrics_sample_interval_seconds=args.metrics_interval,
+            ),
         )
 
         detector = RFDetrPersonDetector(config.detector)
         tracker = ByteTrackTracker(config.tracker)
+        analyzer = None if layout is None else ZoneAnalyzer(layout, config.zones)
 
-        _log_startup(config, metadata, detector.name, tracker.name)
+        _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
 
         logger.info("Loading detector weights (first run may download them)...")
         detector.load()
         logger.info("Detector ready.")
 
-        with Mp4VideoSink(
-            path=config.pipeline.output_path,
-            width=metadata.width,
-            height=metadata.height,
-            fps=metadata.fps,
-        ) as sink:
-            processor = VideoProcessor(detector=detector, tracker=tracker, config=config)
+        with ExitStack() as stack:
+            sink = stack.enter_context(
+                Mp4VideoSink(
+                    path=config.pipeline.output_path,
+                    width=metadata.width,
+                    height=metadata.height,
+                    fps=metadata.fps,
+                )
+            )
+            metrics_writer = (
+                None
+                if args.metrics_output is None
+                else stack.enter_context(JsonlMetricsWriter(args.metrics_output))
+            )
+
+            processor = VideoProcessor(
+                detector=detector,
+                tracker=tracker,
+                config=config,
+                zone_analyzer=analyzer,
+                metrics_writer=metrics_writer,
+            )
             result = processor.run(source, sink)
 
-    _log_completion(result)
+    _log_completion(result, analyzer, args.metrics_output)
     return EXIT_OK
 
 
@@ -188,6 +249,8 @@ def _log_startup(
     metadata: VideoMetadata,
     detector_name: str,
     tracker_name: str,
+    layout: ZoneLayout | None = None,
+    zones_path: Path | None = None,
 ) -> None:
     frames = str(metadata.frame_count) if metadata.frame_count is not None else "unknown"
     logger.info("Atreides Vision %s", __version__)
@@ -203,15 +266,37 @@ def _log_startup(
     )
     logger.info("Tracker:     %s", tracker_name)
     logger.info("Device:      %s", config.detector.device)
+    if layout is None:
+        logger.info("Zones:       disabled (pass --zones to enable zone intelligence)")
+    else:
+        logger.info(
+            "Zones:       %d from %s (camera '%s'): %s",
+            len(layout),
+            zones_path,
+            layout.camera_id,
+            ", ".join(zone.name for zone in layout) or "none",
+        )
 
 
-def _log_completion(result: ProcessingResult) -> None:
+def _log_completion(
+    result: ProcessingResult,
+    analyzer: ZoneAnalyzer | None = None,
+    metrics_path: Path | None = None,
+) -> None:
     logger.info("Done.")
     logger.info("Frames processed:    %d", result.frames_processed)
     logger.info("Elapsed time:        %.2f s", result.elapsed_seconds)
     logger.info("Effective FPS:       %.2f", result.effective_fps)
     logger.info("Unique track IDs:    %d", result.unique_track_ids)
     logger.info("Output:              %s", result.output_path)
+    if analyzer is not None:
+        analyzer.log_summary()
+    if metrics_path is not None:
+        logger.info(
+            "Metrics:             %d records -> %s",
+            result.metrics_records_written,
+            metrics_path,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

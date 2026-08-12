@@ -1,4 +1,4 @@
-"""Pipeline orchestration: read -> detect -> track -> annotate -> write.
+"""Pipeline orchestration: read -> detect -> track -> zones -> annotate -> write.
 
 The processor knows nothing about RF-DETR, ByteTrack, or any model. It talks to
 :class:`~atreides_vision.detection.base.PersonDetector`,
@@ -7,6 +7,10 @@ The processor knows nothing about RF-DETR, ByteTrack, or any model. It talks to
 :class:`~atreides_vision.video.sink.VideoSink` — all Atreides-owned interfaces.
 That is what makes the ML components replaceable and this class testable with
 fakes.
+
+Zone analysis is optional and arrives the same way: as one collaborator, the
+:class:`~atreides_vision.zones.analyzer.ZoneAnalyzer`, which owns everything
+about polygons and metrics. Without it the loop is exactly the V0.1 pipeline.
 """
 
 from __future__ import annotations
@@ -14,17 +18,21 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
+from atreides_vision.models import Track
 from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.video.sink import VideoSink
 from atreides_vision.video.source import VideoSource
 from atreides_vision.video.trajectories import TrajectoryStore
-from atreides_vision.visualization.overlay import Annotator, StatusOverlay
+from atreides_vision.visualization.overlay import Annotator, StatusOverlay, ZoneOverlay
+from atreides_vision.zones.analyzer import ZoneAnalyzer
+from atreides_vision.zones.models import ZoneReport
+from atreides_vision.zones.reporting import MetricsSampler, MetricsWriter
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,10 @@ class ProcessingResult:
     elapsed_seconds: float
     output_path: Path
     unique_track_ids: int
+    #: Final zone metrics, or ``None`` when the run had no zone analyzer.
+    final_zone_report: ZoneReport | None = None
+    #: Records written to the metrics stream, if one was attached.
+    metrics_records_written: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -77,7 +89,11 @@ class ProcessingResult:
 
 
 class VideoProcessor:
-    """Runs the SEE + TRACK pipeline over one video source."""
+    """Runs the SEE + TRACK pipeline over one video source.
+
+    With a ``zone_analyzer`` attached it additionally runs V0.2 zone
+    intelligence. Both are optional collaborators, so a V0.1 run is unchanged.
+    """
 
     def __init__(
         self,
@@ -86,12 +102,16 @@ class VideoProcessor:
         config: VisionConfig,
         annotator: Annotator | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        zone_analyzer: ZoneAnalyzer | None = None,
+        metrics_writer: MetricsWriter | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
         self._config = config
         self._annotator = annotator or Annotator(config.visualization)
         self._clock = clock
+        self._zone_analyzer = zone_analyzer
+        self._metrics_writer = metrics_writer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -106,11 +126,21 @@ class VideoProcessor:
             ttl_frames=visualization.trail_ttl_frames,
             max_trails=visualization.max_trails,
         )
-        fps_meter = FpsMeter()
+        # Shares the processor's clock so an injected clock makes a run — and
+        # therefore the rendered status panel — fully deterministic under test.
+        fps_meter = FpsMeter(clock=self._clock)
         seen_track_ids: set[int] = set()
 
         max_frames = self._config.pipeline.max_frames
         log_every = self._config.pipeline.log_every_n_frames
+
+        metadata = source.metadata
+        # Source timestamps come from the real frame rate. Dwell and speed are
+        # only frame-rate correct because of this; nothing assumes 30 FPS.
+        source_fps = metadata.fps if metadata.fps > 0 else 1.0
+        sampler = MetricsSampler(self._config.zones.metrics_sample_interval_seconds)
+        metrics_records = 0
+        zone_report: ZoneReport | None = None
 
         frames_processed = 0
         started_at = self._clock()
@@ -120,29 +150,43 @@ class VideoProcessor:
                 logger.info("Reached --max-frames limit of %d; stopping early.", max_frames)
                 break
 
+            timestamp_seconds = (frame_index - 1) / source_fps
+
             detections = self._detector.detect(frame)
             tracks = self._tracker.update(detections, frame)
 
             trajectories.update(tracks, frame_index)
             seen_track_ids.update(track.track_id for track in tracks)
 
+            zone_overlay: ZoneOverlay | None = None
+            if self._zone_analyzer is not None:
+                zone_report = self._zone_analyzer.update(
+                    tracks,
+                    frame_index=frame_index,
+                    timestamp_seconds=timestamp_seconds,
+                    frame_width=metadata.width,
+                    frame_height=metadata.height,
+                )
+                zone_overlay = ZoneOverlay.from_report(
+                    self._zone_analyzer.layout.zones, zone_report
+                )
+                if self._metrics_writer is not None and sampler.should_sample(timestamp_seconds):
+                    self._metrics_writer.write(zone_report)
+                    metrics_records += 1
+
             fps_meter.tick()
             status = StatusOverlay(
                 frame_index=frame_index,
                 processing_fps=fps_meter.fps,
                 track_count=len(tracks),
+                zone_count=None if self._zone_analyzer is None else len(self._zone_analyzer.layout),
             )
-            annotated = self._annotator.annotate(frame, tracks, trajectories, status)
+            annotated = self._annotator.annotate(frame, tracks, trajectories, status, zone_overlay)
             sink.write(annotated)
 
             frames_processed += 1
             if frames_processed % log_every == 0:
-                logger.info(
-                    "Processed %d frames | %d active tracks | %.1f FPS",
-                    frames_processed,
-                    len(tracks),
-                    fps_meter.fps,
-                )
+                self._log_progress(frames_processed, tracks, fps_meter.fps, zone_report)
 
         elapsed = self._clock() - started_at
         if frames_processed == 0:
@@ -153,4 +197,33 @@ class VideoProcessor:
             elapsed_seconds=elapsed,
             output_path=getattr(sink, "path", self._config.pipeline.output_path),
             unique_track_ids=len(seen_track_ids),
+            final_zone_report=zone_report,
+            metrics_records_written=metrics_records,
+        )
+
+    def _log_progress(
+        self,
+        frames_processed: int,
+        tracks: Sequence[Track],
+        fps: float,
+        zone_report: ZoneReport | None,
+    ) -> None:
+        """One periodic progress line, with zone occupancy when available."""
+        if zone_report is None:
+            logger.info(
+                "Processed %d frames | %d active tracks | %.1f FPS",
+                frames_processed,
+                len(tracks),
+                fps,
+            )
+            return
+        occupancy = " ".join(
+            f"{snapshot.zone_id}={snapshot.occupancy}" for snapshot in zone_report.snapshots
+        )
+        logger.info(
+            "Processed %d frames | %d active tracks | %.1f FPS | %s",
+            frames_processed,
+            len(tracks),
+            fps,
+            occupancy or "no zones",
         )
