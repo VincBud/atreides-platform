@@ -1,0 +1,65 @@
+[project]
+name = "atreides-platform"
+version = "0.1.0"
+description = "Atreides monorepo root. V0.1 milestone: SEE + TRACK."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "atreides-vision",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["services/vision"]
+
+[tool.uv.sources]
+atreides-vision = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["services/vision/src", "services/vision/tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "ANN",  # type annotations
+    "RUF",
+]
+ignore = [
+    "ANN401",  # allow typing.Any where a third-party surface is genuinely untyped
+]
+
+[tool.ruff.lint.per-file-ignores]
+"services/vision/tests/*" = ["ANN201", "ANN001"]
+
+[tool.pytest.ini_options]
+testpaths = ["services/vision/tests"]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["services/vision/src", "services/vision/tests"]
+strict = true
+# Third-party ML surfaces (rfdetr, trackers, supervision, cv2) ship no usable stubs.
+# They are confined to the adapter modules; everything else is strictly typed.
+[[tool.mypy.overrides]]
+module = ["cv2.*", "rfdetr.*", "trackers.*", "supervision.*", "torch.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["atreides_vision.detection.rfdetr", "atreides_vision.tracking.bytetrack"]
+disallow_any_expr = false
