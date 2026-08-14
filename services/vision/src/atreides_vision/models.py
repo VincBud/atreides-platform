@@ -112,6 +112,22 @@ class BoundingBox:
         """The box centre, used as the trajectory sample point."""
         return Point((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
 
+    @property
+    def bottom_center(self) -> Point:
+        """The middle of the bottom edge — the canonical *floor position*.
+
+        For a camera looking across a floor this is roughly where the person's
+        feet are, and it is what decides which part of the floor they occupy.
+        The box centre sits around chest height and drifts into whatever is
+        behind them, so it is the wrong anchor for anything spatial.
+
+        Every layer that needs a person's position on the ground uses this one
+        definition: zone assignment
+        (:func:`~atreides_vision.zones.geometry.bottom_center`) and behaviour
+        analysis (:func:`~atreides_vision.behavior.coordinates.bottom_center_anchor`).
+        """
+        return Point((self.x1 + self.x2) / 2.0, self.y2)
+
     def clipped_to(self, width: int, height: int) -> BoundingBox:
         """Return a copy clamped to a ``width`` x ``height`` frame."""
         return BoundingBox(

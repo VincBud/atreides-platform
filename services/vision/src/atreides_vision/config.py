@@ -12,6 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from atreides_vision.behavior.config import BehaviorAnalysisConfig
 from atreides_vision.errors import ConfigurationError, DeviceUnavailableError
 from atreides_vision.zones.config import ZoneAnalysisConfig
 
@@ -23,6 +24,7 @@ __all__ = [
     "DEFAULT_OCSORT_HIGH_CONF_THRESHOLD",
     "DEFAULT_TRACKER",
     "AcceleratorProbe",
+    "BehaviorAnalysisConfig",
     "DetectorConfig",
     "Device",
     "PipelineConfig",
@@ -343,6 +345,11 @@ class VisionConfig:
     ``zones`` tunes zone analysis but does not enable it: zone processing runs
     only when the pipeline is given a zone analyzer, which the CLI builds from
     ``--zones``. Without it the run is plain V0.1 SEE + TRACK.
+
+    ``behavior`` works the same way and is likewise inert on its own: V0.3.0
+    signals are produced only when the pipeline is given a
+    :class:`~atreides_vision.behavior.analyzer.BehaviorAnalyzer`, which no CLI
+    flag builds yet.
     """
 
     pipeline: PipelineConfig
@@ -350,3 +357,4 @@ class VisionConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     zones: ZoneAnalysisConfig = field(default_factory=ZoneAnalysisConfig)
+    behavior: BehaviorAnalysisConfig = field(default_factory=BehaviorAnalysisConfig)

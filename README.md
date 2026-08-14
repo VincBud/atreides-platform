@@ -1,9 +1,9 @@
-# Atreides — V0.2.1: FIXED-CCTV VALIDATION
+# Atreides — V0.3: BEHAVIOR SIGNALS (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
 
-**This repository contains the first three technical milestones.** They are
+**This repository contains the first four technical milestones.** They are
 deliberately narrow:
 
 - **V0.1 — SEE + TRACK.** ✅ Find people in a video and follow them frame to frame.
@@ -13,7 +13,11 @@ deliberately narrow:
   defaults by measurement on three materially different fixed cameras.
   Verdict: **PASS WITH DOCUMENTED LIMITATIONS** —
   see [docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md](docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md).
-- **V0.3 — BEHAVIOR SIGNALS.** ⬜ Next.
+- **V0.3 — BEHAVIOR SIGNALS.** 🔄 In progress. Substep **V0.3.0 (behaviour signal
+  foundation)** is built: neutral kinematic signals — speed, acceleration, turn rate,
+  stationary duration — measured in an abstract coordinate space rather than pixels.
+  See [docs/vision/V0.3_BEHAVIOR_SIGNALS.md](docs/vision/V0.3_BEHAVIOR_SIGNALS.md).
+  Not yet exposed through the CLI.
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -52,7 +56,10 @@ These are product and privacy boundaries, not missing features:
 - **It does not identify people.** A track ID is a handle on a box moving through
   one video. It is not a person, a name, or a record.
 - **It does not perform face recognition** — or any biometric recognition.
-- **It does not infer aggression**, intent, emotion, or behaviour.
+- **It does not infer aggression**, intent, emotion, or intoxication. V0.3
+  *measures* movement — speed, acceleration, turn rate, time spent still — and
+  stops there. A measurement is not a judgement, and none of these signals is
+  labelled, scored or ranked.
 - **It does not classify demographics.**
 - **It does not make security decisions.** It produces a view for a human operator.
 - **It does not perform cross-camera re-identification.** Track IDs are local to one
@@ -327,6 +334,12 @@ motion-level bounds, memory cleanup, the overlay, the CLI, and the full pipeline
 end-to-end with fake detector and tracker implementations — including a regression
 guard that a run without `--zones` still behaves as V0.1.
 
+V0.3 adds coordinate projection, the kinematic formulas checked against closed-form
+synthetic trajectories, motion segments and gap handling, per-subject state
+isolation, and — the important one — **resolution invariance**: the same trajectory
+at 384×288 and 1920×1080 must produce identical signals, where a pixel-based
+measurement would have differed fivefold.
+
 ## Architecture
 
 ```text
@@ -354,6 +367,13 @@ atreides-platform/
 │   │   │   │   ├── metrics.py           # motion level, snapshot assembly
 │   │   │   │   ├── analyzer.py          # the facade VideoProcessor orchestrates
 │   │   │   │   └── reporting.py         # JSONL metrics stream
+│   │   │   ├── behavior/            # V0.3 behaviour signals
+│   │   │   │   ├── coordinates.py       # MotionSpace, projectors — never raw pixels
+│   │   │   │   ├── models.py            # SubjectRef, BehaviorObservation, BehaviorSignal
+│   │   │   │   ├── config.py            # tunables, each with a unit and rationale
+│   │   │   │   ├── history.py           # bounded per-subject motion segments
+│   │   │   │   ├── kinematics.py        # pure formulas, no state
+│   │   │   │   └── analyzer.py          # the facade VideoProcessor orchestrates
 │   │   │   └── visualization/       # overlay drawing
 │   │   └── tests/
 │   ├── intelligence/            # placeholder
@@ -377,6 +397,11 @@ annotator. With no analyzer the loop is byte-for-byte the V0.1 pipeline.
 The zone layer consumes `Track` objects and nothing else. It has no import of
 RF-DETR, ByteTrack or any model, so swapping either leaves zone intelligence
 untouched — the same property the detector and tracker adapters exist to provide.
+
+V0.3's `BehaviorAnalyzer` attaches the same way and holds to the same rule: it
+consumes `Track` objects and a coordinate projector, imports no model *and not the
+zone layer either*, and is measurement-only — a run with one attached renders
+byte-identical output to one without.
 
 ### Why the detector and tracker sit behind adapters
 
@@ -431,20 +456,43 @@ Two further design notes:
 V0.2 added no dependencies. Point-in-polygon is ~20 lines of ray casting rather than
 a geometry library, which keeps the boundary contract ours to define and test.
 
+V0.3 added none either — the behaviour package uses only the standard library, and
+not even NumPy or OpenCV.
+
 Dev: `pytest`, `ruff`, `mypy`. Deliberately absent: Ultralytics, cloud SDKs, database
 libraries, web frameworks, Docker.
 
-## Next milestone — V0.3: BEHAVIOR SIGNALS
+## Current milestone — V0.3: BEHAVIOR SIGNALS
 
-V0.2.1 closed the question of *which* configuration to run and documented what is
-known about it. V0.3 turns tracks into behaviour signals.
+V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
+behaviour signals — and **V0.3.0, the signal foundation, is built**.
+
+Four neutral measurements per tracked subject per frame: `speed`, `acceleration`,
+`heading_change_rate` and `stationary_duration`. Each carries its subject, timestamp,
+unit, coordinate space and an estimate-support quality. None carries a label,
+score or judgement.
+
+The point of the milestone is the architecture underneath. Behaviour maths never
+touches a pixel: an injectable `MotionProjector` converts a person's bottom-centre
+anchor into an abstract `MotionSpace`, so nothing encodes a venue size, a camera
+coverage area, a mounting height or a resolution. V0.3.0 ships one projector —
+normalized image coordinates, which are **resolution-independent but camera-local**.
+Its values are not metres, and two arbitrary cameras' values are not comparable.
+A calibrated ground-plane projector is the planned next step and needs no change to
+any signal.
+
+Behaviour analysis attaches to `VideoProcessor` as an optional collaborator, exactly
+as zones do, and is measurement-only: with one attached the rendered output is
+byte-identical. **There is no CLI flag yet** — that arrives with V0.3.1 alongside a
+signal output stream.
 
 The binding constraint it inherits is limitation (2) from the V0.2.1 report: a
-unique track ID is not a unique person, so any occupancy- or footfall-derived
-signal built on ID counts will over-count until ID persistence improves.
-Calibration belongs here too — a homography from four floor reference points would
-turn image-plane speed into real floor distance and make zones robust to camera
-framing. Per-camera tuning of `motion_reference_speed` belongs there as well.
+unique track ID is not a unique person. V0.3.0 does not fix it and does not pretend
+to — every signal carries a `(camera_id, track_id)` subject reference rather than a
+bare id, so a future fusion layer can map them without rewriting any algorithm.
 
-Identity, biometrics, demographics and cross-camera matching remain out of scope by
-design.
+Full detail, including the complete limitation list:
+[docs/vision/V0.3_BEHAVIOR_SIGNALS.md](docs/vision/V0.3_BEHAVIOR_SIGNALS.md).
+
+Identity, biometrics, demographics, cross-camera matching, risk scoring and
+behaviour *classification* remain out of scope by design.

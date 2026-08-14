@@ -11,6 +11,11 @@ fakes.
 Zone analysis is optional and arrives the same way: as one collaborator, the
 :class:`~atreides_vision.zones.analyzer.ZoneAnalyzer`, which owns everything
 about polygons and metrics. Without it the loop is exactly the V0.1 pipeline.
+
+V0.3 behaviour signals attach identically, as an optional
+:class:`~atreides_vision.behavior.analyzer.BehaviorAnalyzer`. It observes the
+same tracks and changes nothing that is drawn or written: a run without one is
+byte-for-byte what it was before.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from atreides_vision.behavior.analyzer import BehaviorAnalyzer
+from atreides_vision.behavior.models import BehaviorFrame
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
 from atreides_vision.detection.deduplication import deduplicate_with_report
@@ -87,6 +94,10 @@ class ProcessingResult:
     metrics_records_written: int = 0
     #: Detections suppressed by deduplication. Always 0 when it is disabled.
     detections_removed_by_deduplication: int = 0
+    #: Final behaviour signals, or ``None`` when the run had no behaviour analyzer.
+    final_behavior_frame: BehaviorFrame | None = None
+    #: Behaviour signals emitted across the run. Always 0 without an analyzer.
+    behavior_signals_emitted: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -100,7 +111,9 @@ class VideoProcessor:
     """Runs the SEE + TRACK pipeline over one video source.
 
     With a ``zone_analyzer`` attached it additionally runs V0.2 zone
-    intelligence. Both are optional collaborators, so a V0.1 run is unchanged.
+    intelligence; with a ``behavior_analyzer`` it additionally measures V0.3
+    behaviour signals. All are optional collaborators, so a V0.1 run is
+    unchanged and a V0.2 run stays exactly as it was.
     """
 
     def __init__(
@@ -113,6 +126,7 @@ class VideoProcessor:
         zone_analyzer: ZoneAnalyzer | None = None,
         metrics_writer: MetricsWriter | None = None,
         tracking_debug_writer: TrackingDebugWriter | None = None,
+        behavior_analyzer: BehaviorAnalyzer | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -122,6 +136,7 @@ class VideoProcessor:
         self._zone_analyzer = zone_analyzer
         self._metrics_writer = metrics_writer
         self._tracking_debug_writer = tracking_debug_writer
+        self._behavior_analyzer = behavior_analyzer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -151,6 +166,7 @@ class VideoProcessor:
         sampler = MetricsSampler(self._config.zones.metrics_sample_interval_seconds)
         metrics_records = 0
         zone_report: ZoneReport | None = None
+        behavior_frame: BehaviorFrame | None = None
 
         deduplicate = self._config.pipeline.deduplicate_detections
         detections_removed = 0
@@ -214,6 +230,17 @@ class VideoProcessor:
                     self._metrics_writer.write(zone_report)
                     metrics_records += 1
 
+            if self._behavior_analyzer is not None:
+                # Measurement only: the returned signals are not drawn and do
+                # not influence anything the pipeline writes. Zone context is
+                # not passed through yet — that seam is V0.3.1 — which is why
+                # behaviour analysis works with or without zones configured.
+                behavior_frame = self._behavior_analyzer.update(
+                    tracks,
+                    frame_index=frame_index,
+                    timestamp_seconds=timestamp_seconds,
+                )
+
             fps_meter.tick()
             status = StatusOverlay(
                 frame_index=frame_index,
@@ -240,6 +267,10 @@ class VideoProcessor:
             final_zone_report=zone_report,
             metrics_records_written=metrics_records,
             detections_removed_by_deduplication=detections_removed,
+            final_behavior_frame=behavior_frame,
+            behavior_signals_emitted=(
+                0 if self._behavior_analyzer is None else self._behavior_analyzer.signals_emitted
+            ),
         )
 
     def _log_progress(

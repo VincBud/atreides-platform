@@ -68,8 +68,13 @@ class NormalizedPoint:
 
 
 def bottom_center(bbox: BoundingBox) -> Point:
-    """The bottom-centre of a box, in pixels — the approximate floor position."""
-    return Point((bbox.x1 + bbox.x2) / 2.0, bbox.y2)
+    """The bottom-centre of a box, in pixels — the approximate floor position.
+
+    Delegates to :attr:`~atreides_vision.models.BoundingBox.bottom_center` so
+    the floor-position convention has exactly one definition, shared with the
+    behaviour layer.
+    """
+    return bbox.bottom_center
 
 
 def to_normalized(point: Point, frame_width: int, frame_height: int) -> NormalizedPoint:
