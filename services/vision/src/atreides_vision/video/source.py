@@ -16,7 +16,7 @@ from atreides_vision.errors import VideoSourceError
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FileVideoSource", "VideoMetadata", "VideoSource"]
+__all__ = ["FileVideoSource", "VideoMetadata", "VideoSource", "read_reference_frame"]
 
 #: Frame rate assumed when a container reports a nonsensical value.
 DEFAULT_FALLBACK_FPS = 25.0
@@ -42,6 +42,44 @@ class VideoMetadata:
         if self.frame_count is None or self.fps <= 0:
             return None
         return self.frame_count / self.fps
+
+
+def read_reference_frame(path: Path | str) -> np.ndarray:
+    """Read a single frame from an image file, or the first frame of a video.
+
+    Calibration diagnostics need one still to draw on, and an operator will
+    reasonably reach for either a screenshot or the clip itself. Images are
+    tried first because ``cv2.imread`` simply returns ``None`` for a video
+    container, which makes the fallback unambiguous.
+
+    Args:
+        path: An image or video file.
+
+    Returns:
+        A ``(H, W, 3)`` uint8 BGR frame.
+
+    Raises:
+        VideoSourceError: if the file is missing, is not a file, or cannot be
+            decoded as either an image or a video.
+    """
+    frame_path = Path(path)
+    if not frame_path.exists():
+        raise VideoSourceError(f"Reference frame not found: {frame_path}")
+    if not frame_path.is_file():
+        raise VideoSourceError(f"Reference frame path is not a file: {frame_path}")
+
+    image = cv2.imread(str(frame_path))
+    if image is not None and image.size > 0:
+        return np.asarray(image)
+
+    with FileVideoSource(frame_path) as source:
+        for frame in source.frames():
+            return frame
+
+    raise VideoSourceError(
+        f"Could not read a frame from {frame_path}: it decoded as neither an image nor a "
+        "video with at least one frame."
+    )
 
 
 class VideoSource(Protocol):

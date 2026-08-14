@@ -46,6 +46,7 @@ from atreides_vision.behavior.models import (
     BehaviorFrame,
     BehaviorObservation,
     BehaviorSignal,
+    BehaviorSubjectSnapshot,
     SignalType,
     SubjectRef,
 )
@@ -181,7 +182,7 @@ class BehaviorAnalyzer:
         Returns:
             Every signal computable for this frame, grouped in track order.
         """
-        signals: list[BehaviorSignal] = []
+        snapshots: list[BehaviorSubjectSnapshot] = []
 
         for track in tracks:
             subject = SubjectRef(camera_id=self._camera_id, track_id=track.track_id)
@@ -216,16 +217,25 @@ class BehaviorAnalyzer:
                 zone_ids=zone_ids,
             )
             history = self._history.observe(observation)
-            signals.extend(self._signals_for(history, observation))
+            snapshots.append(
+                BehaviorSubjectSnapshot(
+                    subject=subject,
+                    frame_index=frame_index,
+                    timestamp_seconds=timestamp_seconds,
+                    position=position,
+                    signals=tuple(self._signals_for(history, observation)),
+                    zone_ids=zone_ids,
+                )
+            )
 
         self._history.prune(frame_index)
 
-        frame = BehaviorFrame(
+        frame = BehaviorFrame.from_snapshots(
             frame_index=frame_index,
             timestamp_seconds=timestamp_seconds,
-            signals=tuple(signals),
+            snapshots=snapshots,
         )
-        self._signals_emitted += len(signals)
+        self._signals_emitted += len(frame.signals)
         self._latest = frame
         return frame
 

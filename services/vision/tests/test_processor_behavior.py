@@ -7,6 +7,8 @@ one must leave the V0.1/V0.2 pipeline exactly as it was.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from itertools import count
 from pathlib import Path
 
@@ -15,8 +17,8 @@ import pytest
 
 from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.config import BehaviorAnalysisConfig
-from atreides_vision.behavior.coordinates import NormalizedFrameProjector
-from atreides_vision.behavior.models import SignalType, SubjectRef
+from atreides_vision.behavior.coordinates import MotionSpace, NormalizedFrameProjector
+from atreides_vision.behavior.models import BehaviorFrame, SignalType, SubjectRef
 from atreides_vision.config import PipelineConfig, VisionConfig, VisualizationConfig
 from atreides_vision.models import BoundingBox, Detection
 from atreides_vision.video.processor import VideoProcessor
@@ -61,6 +63,20 @@ def make_analyzer(**overrides: object) -> BehaviorAnalyzer:
         projector=NormalizedFrameProjector(FRAME_W, FRAME_H),
         config=BehaviorAnalysisConfig(**overrides),  # type: ignore[arg-type]
     )
+
+
+class RecordingBehaviorWriter:
+    """A :class:`BehaviorWriter` that keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.frames: list[BehaviorFrame] = []
+        self.released = False
+
+    def write_frame(self, frame: BehaviorFrame) -> None:
+        self.frames.append(frame)
+
+    def release(self) -> None:
+        self.released = True
 
 
 def walking_script(steps: int, speed_per_frame: float = 0.008) -> list[list[Detection]]:
@@ -239,3 +255,90 @@ class TestIntegration:
             return result.final_behavior_frame.to_records()
 
         assert records() == records()
+
+
+class TestBehaviorWriterIntegration:
+    """The processor must actually drive the writer, and only when given one."""
+
+    def test_writer_receives_one_call_per_frame(self, tmp_path: Path) -> None:
+        writer = RecordingBehaviorWriter()
+        VideoProcessor(
+            FakeDetector(walking_script(12)),
+            FakeTracker(),
+            make_config(tmp_path),
+            behavior_analyzer=make_analyzer(),
+            behavior_writer=writer,
+        ).run(source(12), FakeSink())
+
+        assert len(writer.frames) == 12
+        assert [frame.frame_index for frame in writer.frames] == list(range(1, 13))
+
+    def test_written_frames_carry_positions(self, tmp_path: Path) -> None:
+        writer = RecordingBehaviorWriter()
+        VideoProcessor(
+            FakeDetector(walking_script(10)),
+            FakeTracker(),
+            make_config(tmp_path),
+            behavior_analyzer=make_analyzer(),
+            behavior_writer=writer,
+        ).run(source(10), FakeSink())
+
+        snapshots = writer.frames[-1].snapshots
+        assert len(snapshots) == 1
+        assert snapshots[0].subject == SubjectRef(CAMERA, 0)
+        assert snapshots[0].space is MotionSpace.NORMALIZED_IMAGE
+
+    def test_no_writer_means_the_analyzer_still_runs(self, tmp_path: Path) -> None:
+        analyzer = make_analyzer()
+        result = VideoProcessor(
+            FakeDetector(walking_script(10)),
+            FakeTracker(),
+            make_config(tmp_path),
+            behavior_analyzer=analyzer,
+        ).run(source(10), FakeSink())
+        assert result.behavior_signals_emitted > 0
+
+    def test_no_analyzer_means_the_writer_is_never_called(self, tmp_path: Path) -> None:
+        """A writer without an analyzer has nothing to write, and must stay silent."""
+        writer = RecordingBehaviorWriter()
+        VideoProcessor(
+            FakeDetector(walking_script(10)),
+            FakeTracker(),
+            make_config(tmp_path),
+            behavior_writer=writer,
+        ).run(source(10), FakeSink())
+        assert writer.frames == []
+
+    def test_writer_sees_the_same_frames_the_result_reports(self, tmp_path: Path) -> None:
+        writer = RecordingBehaviorWriter()
+        result = VideoProcessor(
+            FakeDetector(walking_script(20)),
+            FakeTracker(),
+            make_config(tmp_path),
+            behavior_analyzer=make_analyzer(),
+            behavior_writer=writer,
+        ).run(source(20), FakeSink())
+
+        assert writer.frames[-1] is result.final_behavior_frame
+        assert sum(len(frame) for frame in writer.frames) == result.behavior_signals_emitted
+
+
+class TestImportOrder:
+    """Regression: the visualization package must import standalone.
+
+    ``visualization.overlay`` used to import the ``video`` package at runtime,
+    whose ``__init__`` imports the processor, which imports ``overlay`` — a
+    cycle that only failed when ``visualization`` was imported first. The
+    annotation is now type-only.
+    """
+
+    def test_visualization_imports_before_video(self) -> None:
+        script = (
+            "import atreides_vision.visualization.calibration_overlay as m; "
+            "assert m.render_calibration_overlay is not None"
+        )
+        assert subprocess.run([sys.executable, "-c", script], check=False).returncode == 0
+
+    def test_video_imports_before_visualization(self) -> None:
+        script = "import atreides_vision.video; import atreides_vision.visualization"
+        assert subprocess.run([sys.executable, "-c", script], check=False).returncode == 0

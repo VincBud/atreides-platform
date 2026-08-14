@@ -29,6 +29,7 @@ from pathlib import Path
 
 from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.models import BehaviorFrame
+from atreides_vision.behavior.reporting import BehaviorWriter
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
 from atreides_vision.detection.deduplication import deduplicate_with_report
@@ -127,6 +128,7 @@ class VideoProcessor:
         metrics_writer: MetricsWriter | None = None,
         tracking_debug_writer: TrackingDebugWriter | None = None,
         behavior_analyzer: BehaviorAnalyzer | None = None,
+        behavior_writer: BehaviorWriter | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -137,6 +139,7 @@ class VideoProcessor:
         self._metrics_writer = metrics_writer
         self._tracking_debug_writer = tracking_debug_writer
         self._behavior_analyzer = behavior_analyzer
+        self._behavior_writer = behavior_writer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -231,15 +234,20 @@ class VideoProcessor:
                     metrics_records += 1
 
             if self._behavior_analyzer is not None:
-                # Measurement only: the returned signals are not drawn and do
-                # not influence anything the pipeline writes. Zone context is
-                # not passed through yet — that seam is V0.3.1 — which is why
-                # behaviour analysis works with or without zones configured.
+                # Measurement only: the signals are written to their own stream
+                # and never drawn, so the rendered video is identical with and
+                # without behaviour enabled. Zone context is not passed through
+                # yet, which is why behaviour analysis works with or without
+                # zones configured.
                 behavior_frame = self._behavior_analyzer.update(
                     tracks,
                     frame_index=frame_index,
                     timestamp_seconds=timestamp_seconds,
                 )
+                if self._behavior_writer is not None:
+                    # Streamed per frame, never accumulated: a long run costs no
+                    # more memory than a short one.
+                    self._behavior_writer.write_frame(behavior_frame)
 
             fps_meter.tick()
             status = StatusOverlay(

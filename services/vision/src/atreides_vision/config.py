@@ -34,6 +34,7 @@ __all__ = [
     "VisionConfig",
     "VisualizationConfig",
     "ZoneAnalysisConfig",
+    "resolve_camera_id",
     "resolve_device",
 ]
 
@@ -154,6 +155,74 @@ def resolve_device(requested: Device, probe: AcceleratorProbe | None = None) -> 
         return "mps"
     logger.info("No GPU accelerator detected; falling back to CPU.")
     return "cpu"
+
+
+def resolve_camera_id(
+    explicit: str | None = None,
+    calibration_camera_id: str | None = None,
+    zone_camera_id: str | None = None,
+) -> str:
+    """Resolve the camera identity that behaviour records are namespaced by.
+
+    Behaviour output is keyed by *(camera_id, track_id)*, so the camera id is
+    not cosmetic: it is half of every subject reference in the stream. Several
+    places can supply one, and they must agree.
+
+    Precedence, highest first:
+
+    1. an explicit ``--camera-id``
+    2. the calibration's ``camera_id``
+    3. the zone configuration's ``camera_id``
+
+    **Disagreement is always an error, never a silent win for the higher
+    source.** If a calibration says ``cam_01`` and the operator passes
+    ``cam_02``, one of the two is wrong about which camera this footage came
+    from — and guessing would attach metric positions from one camera's floor
+    geometry to another camera's name.
+
+    No default is invented when nothing supplies one. A fabricated id would
+    silently merge records from different cameras that were both processed
+    under the same placeholder.
+
+    Args:
+        explicit: Value passed on the command line, if any.
+        calibration_camera_id: ``camera_id`` from a loaded calibration, if any.
+        zone_camera_id: ``camera_id`` from a loaded zone layout, if any.
+
+    Returns:
+        The agreed camera id.
+
+    Raises:
+        ConfigurationError: if the supplied sources disagree, if an explicit
+            value is blank, or if no source supplies one.
+    """
+    if explicit is not None and not explicit.strip():
+        raise ConfigurationError("--camera-id must not be blank.")
+
+    candidates = (
+        ("--camera-id", explicit),
+        ("the calibration", calibration_camera_id),
+        ("the zone configuration", zone_camera_id),
+    )
+    supplied = [(source, value) for source, value in candidates if value is not None]
+
+    if not supplied:
+        raise ConfigurationError(
+            "Behaviour output needs a camera id, and none was supplied. Pass --camera-id, "
+            "or use a --calibration or --zones file that names the camera. It is not "
+            "defaulted because records from different cameras would then share one id."
+        )
+
+    distinct = {value for _, value in supplied}
+    if len(distinct) > 1:
+        detail = ", ".join(f"{source} says '{value}'" for source, value in supplied)
+        raise ConfigurationError(
+            f"Conflicting camera ids: {detail}. These must name the same camera — one of "
+            "them is describing different footage. Correct the mismatch rather than "
+            "letting one override the other."
+        )
+
+    return supplied[0][1]
 
 
 @dataclass(frozen=True, slots=True)

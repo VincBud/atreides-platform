@@ -34,7 +34,7 @@ import numpy as np
 
 from atreides_vision.behavior.coordinates import MotionPoint, MotionSpace
 from atreides_vision.calibration.fitting import CalibrationFit, fit_calibration
-from atreides_vision.calibration.homography import project_point
+from atreides_vision.calibration.homography import invert_homography, project_point
 from atreides_vision.calibration.models import (
     CalibrationQuality,
     GroundPlaneCalibration,
@@ -100,7 +100,9 @@ class GroundPlaneProjector:
             ],
             dtype=np.float64,
         )
-        self._matrix = tuple(float(value) for value in (fit.matrix @ scale).reshape(-1))
+        self._effective = fit.matrix @ scale
+        self._matrix = tuple(float(value) for value in self._effective.reshape(-1))
+        self._inverse: tuple[float, ...] | None = None
 
     @classmethod
     def from_calibration(
@@ -183,6 +185,42 @@ class GroundPlaneProjector:
         """
         x, y = project_point(self._matrix, point.x, point.y)
         return VenuePoint(x=x, y=y)
+
+    def project_from_venue(self, venue: VenuePoint) -> Point:
+        """Project a venue position back into **runtime** image pixels.
+
+        The inverse direction, needed to draw venue geometry — a metre grid, the
+        axes, the calibrated hull — onto a frame for inspection. It inverts the
+        *effective* transform, so the result is in runtime pixels and the
+        overlay lands correctly on a rescaled frame.
+
+        Scope is deliberately narrow. This exists for calibration diagnostics
+        and drawing; behaviour algorithms never see it, and no raw matrix is
+        exposed. Measurement runs image-to-venue only.
+
+        Raises:
+            CalibrationError: if the transform cannot be inverted.
+            ProjectionError: if this venue position has no image position — it
+                lies on the image plane's horizon under the inverse transform.
+        """
+        x, y = project_point(self._inverse_matrix(), venue.x, venue.y)
+        return Point(x=x, y=y)
+
+    def _inverse_matrix(self) -> tuple[float, ...]:
+        """The venue-to-runtime-pixel transform. Computed once, on first use."""
+        if self._inverse is None:
+            inverse = invert_homography(self._effective)
+            # Orient so venue points inside the calibrated region invert with a
+            # positive homogeneous w, matching the forward convention and making
+            # "behind the horizon" mean the same thing in both directions.
+            venue_points = self._fit.calibration.venue_points()
+            homogeneous = np.column_stack(
+                [venue_points, np.ones(len(venue_points), dtype=np.float64)]
+            )
+            if np.all(homogeneous @ inverse[2, :] < 0):
+                inverse = -inverse
+            self._inverse = tuple(float(value) for value in inverse.reshape(-1))
+        return self._inverse
 
     def shares_venue_with(self, other: GroundPlaneProjector) -> bool:
         """Whether another camera's projector emits into the same venue frame.

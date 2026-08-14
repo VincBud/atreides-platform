@@ -21,7 +21,21 @@ from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
+
 from atreides_vision import __version__
+from atreides_vision.behavior.analyzer import BehaviorAnalyzer
+from atreides_vision.behavior.config import BehaviorAnalysisConfig
+from atreides_vision.behavior.coordinates import NormalizedFrameProjector
+from atreides_vision.behavior.reporting import (
+    BehaviorRunMetadata,
+    CalibrationProvenance,
+    JsonlBehaviorWriter,
+    SourceProvenance,
+)
+from atreides_vision.calibration.fitting import CalibrationFit
+from atreides_vision.calibration.loader import load_calibration_fit
+from atreides_vision.calibration.projector import GroundPlaneProjector
 from atreides_vision.config import (
     DEFAULT_DEDUPLICATE_DETECTIONS,
     DEFAULT_DETECTION_CONFIDENCE,
@@ -35,6 +49,7 @@ from atreides_vision.config import (
     VisionConfig,
     VisualizationConfig,
     ZoneAnalysisConfig,
+    resolve_camera_id,
     resolve_device,
 )
 from atreides_vision.detection.rfdetr import RFDetrPersonDetector
@@ -45,7 +60,11 @@ from atreides_vision.tracking.diagnostics import JsonlTrackingDebugWriter
 from atreides_vision.tracking.ocsort import OcSortTracker
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
-from atreides_vision.video.source import FileVideoSource, VideoMetadata
+from atreides_vision.video.source import FileVideoSource, VideoMetadata, read_reference_frame
+from atreides_vision.visualization.calibration_overlay import (
+    CalibrationOverlayConfig,
+    render_calibration_overlay,
+)
 from atreides_vision.zones.analyzer import ZoneAnalyzer
 from atreides_vision.zones.loader import load_zone_layout
 from atreides_vision.zones.models import ZoneLayout
@@ -196,6 +215,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds of source time between metric records. Default: 1.0.",
     )
     run_parser.add_argument(
+        "--behavior-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write per-subject behaviour signals as JSON Lines "
+            "(e.g. artifacts/behavior.jsonl). This flag is what enables behaviour "
+            "analysis at all; without it the run is unchanged. Neutral measurements "
+            "only — speed, acceleration, turn rate, time spent stationary."
+        ),
+    )
+    run_parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Ground-plane calibration JSON (e.g. config/calibration.example.json). "
+            "Switches behaviour measurement from normalized image units to venue "
+            "metres. Requires --behavior-output. An invalid calibration is an error, "
+            "never a silent fallback to normalized units."
+        ),
+    )
+    run_parser.add_argument(
+        "--camera-id",
+        type=str,
+        default=None,
+        metavar="ID",
+        help=(
+            "Camera identity that behaviour records are namespaced by. Defaults to the "
+            "camera named by --calibration or --zones; required when neither is given. "
+            "A value conflicting with either of those is an error."
+        ),
+    )
+    run_parser.add_argument(
         "--trail-length",
         type=int,
         default=25,
@@ -221,7 +275,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable debug logging.",
     )
     run_parser.set_defaults(handler=_run_command)
+    _add_calibration_commands(subparsers)
     return parser
+
+
+def _add_calibration_commands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Attach the ``calibration`` inspection commands.
+
+    Inspection only: these read a calibration and report or draw it. There is
+    no editor, no interactive point picking and no automatic calibration.
+    """
+    calibration_parser = subparsers.add_parser(
+        "calibration",
+        help="Inspect a ground-plane calibration.",
+        description=(
+            "Check a calibration before trusting metres from it. "
+            "'validate' reports the fit numerically; 'render' draws it on a frame."
+        ),
+    )
+    calibration_sub = calibration_parser.add_subparsers(dest="calibration_command", required=True)
+
+    validate_parser = calibration_sub.add_parser(
+        "validate",
+        help="Solve a calibration and report its fit.",
+        description=(
+            "Load a calibration, solve the homography, and report the correspondences "
+            "and reprojection error. Reprojection error measures how well the fit "
+            "reproduces the operator's own reference points — it is not a measurement "
+            "of real-world accuracy."
+        ),
+    )
+    validate_parser.add_argument(
+        "--calibration",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Calibration JSON to inspect.",
+    )
+    validate_parser.set_defaults(handler=_calibration_validate_command)
+
+    render_parser = calibration_sub.add_parser(
+        "render",
+        help="Draw a calibration onto a frame for visual inspection.",
+        description=(
+            "Draw the venue grid, axes and reference points onto a still, so the "
+            "geometry can be checked by eye against the actual floor. This is the "
+            "only check that can catch reference points measured against the wrong "
+            "spot, which reprojection error cannot detect."
+        ),
+    )
+    render_parser.add_argument(
+        "--calibration",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Calibration JSON to draw.",
+    )
+    render_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Image, or video whose first frame is used.",
+    )
+    render_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Destination image (e.g. artifacts/calibration.png).",
+    )
+    render_parser.add_argument(
+        "--grid-spacing",
+        type=float,
+        default=1.0,
+        metavar="METRES",
+        help="Venue grid spacing in metres. Default: 1.0.",
+    )
+    render_parser.add_argument(
+        "--no-grid",
+        action="store_true",
+        help="Omit the venue grid, leaving reference points and axes.",
+    )
+    render_parser.set_defaults(handler=_calibration_render_command)
 
 
 def build_tracker(choice: Tracker, config: TrackerConfig) -> MultiObjectTracker:
@@ -261,6 +399,82 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def _build_behavior_analyzer(
+    camera_id: str,
+    metadata: VideoMetadata,
+    calibration_fit: CalibrationFit | None,
+) -> BehaviorAnalyzer:
+    """Choose the projector and the matching threshold set.
+
+    The two travel together and must never be mixed: normalized distance
+    thresholds interpreted as metres would mean nobody is ever stationary, and
+    the reverse would mean everybody always is. ``intended_space`` on the config
+    makes the analyzer enforce the pairing rather than leaving it to this
+    function being correct.
+    """
+    if calibration_fit is None:
+        return BehaviorAnalyzer(
+            camera_id=camera_id,
+            projector=NormalizedFrameProjector(metadata.width, metadata.height),
+            config=BehaviorAnalysisConfig(),
+        )
+
+    # A calibration that cannot be solved has already raised by this point;
+    # there is deliberately no fallback to normalized units, which would keep
+    # the output looking valid while silently changing what it means.
+    return BehaviorAnalyzer(
+        camera_id=camera_id,
+        projector=GroundPlaneProjector(
+            calibration_fit, frame_width=metadata.width, frame_height=metadata.height
+        ),
+        config=BehaviorAnalysisConfig.for_ground_plane_metres(),
+    )
+
+
+def _build_run_metadata(
+    camera_id: str,
+    analyzer: BehaviorAnalyzer,
+    input_path: Path,
+    metadata: VideoMetadata,
+    calibration_fit: CalibrationFit | None,
+) -> BehaviorRunMetadata:
+    """Assemble the header record, including calibration provenance.
+
+    Provenance is flattened here, in the composition root, rather than by the
+    behaviour layer reaching into the calibration package — that direction of
+    dependency is what keeps behaviour analysis usable with no calibration.
+    """
+    provenance = None
+    if calibration_fit is not None:
+        quality = calibration_fit.quality
+        calibration = calibration_fit.calibration
+        provenance = CalibrationProvenance(
+            venue_id=calibration.venue_id,
+            surface_id=calibration.surface_id,
+            reference_width=calibration.reference_frame.width,
+            reference_height=calibration.reference_frame.height,
+            correspondence_count=quality.point_count,
+            mean_venue_error_m=quality.mean_venue_error_m,
+            max_venue_error_m=quality.max_venue_error_m,
+            mean_image_error_px=quality.mean_image_error_px,
+            max_image_error_px=quality.max_image_error_px,
+            relative_error=quality.relative_error,
+            venue_extent_m=quality.venue_extent_m,
+        )
+
+    return BehaviorRunMetadata(
+        camera_id=camera_id,
+        space=analyzer.space,
+        source=SourceProvenance(
+            path=str(input_path),
+            width=metadata.width,
+            height=metadata.height,
+            fps=metadata.fps,
+        ),
+        calibration=provenance,
+    )
+
+
 def _run_command(args: argparse.Namespace) -> int:
     _configure_logging(args.verbose)
 
@@ -268,6 +482,12 @@ def _run_command(args: argparse.Namespace) -> int:
         raise ConfigurationError(
             "--metrics-output needs zones to measure. Add --zones config/zones.example.json, "
             "or drop --metrics-output."
+        )
+    if args.calibration is not None and args.behavior_output is None:
+        raise ConfigurationError(
+            "--calibration only affects behaviour measurement, so it needs "
+            "--behavior-output artifacts/behavior.jsonl. Use 'atreides-vision calibration "
+            "validate' to check a calibration on its own."
         )
 
     pipeline_config = PipelineConfig(
@@ -279,8 +499,22 @@ def _run_command(args: argparse.Namespace) -> int:
     )
     device = resolve_device(args.device)
 
-    # Fail on a bad zone file before loading a detector or touching the video.
+    # Fail on a bad zone or calibration file before loading a detector or
+    # touching the video. Loading the calibration also solves it, so unusable
+    # geometry stops the run here rather than a thousand frames in.
     layout = None if args.zones is None else load_zone_layout(args.zones)
+    calibration_fit = None if args.calibration is None else load_calibration_fit(args.calibration)
+
+    behavior_enabled = args.behavior_output is not None
+    camera_id = (
+        resolve_camera_id(
+            explicit=args.camera_id,
+            calibration_camera_id=None if calibration_fit is None else calibration_fit.camera_id,
+            zone_camera_id=None if layout is None else layout.camera_id,
+        )
+        if behavior_enabled
+        else None
+    )
 
     with FileVideoSource(pipeline_config.input_path) as source:
         metadata = source.metadata
@@ -302,8 +536,14 @@ def _run_command(args: argparse.Namespace) -> int:
         detector = RFDetrPersonDetector(config.detector)
         tracker = build_tracker(args.tracker, config.tracker)
         analyzer = None if layout is None else ZoneAnalyzer(layout, config.zones)
+        behavior_analyzer = (
+            None
+            if camera_id is None
+            else _build_behavior_analyzer(camera_id, metadata, calibration_fit)
+        )
 
         _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
+        _log_behavior_startup(behavior_analyzer, calibration_fit, args.behavior_output)
 
         logger.info("Loading detector weights (first run may download them)...")
         detector.load()
@@ -328,6 +568,22 @@ def _run_command(args: argparse.Namespace) -> int:
                 if args.tracking_debug_output is None
                 else stack.enter_context(JsonlTrackingDebugWriter(args.tracking_debug_output))
             )
+            behavior_writer = (
+                None
+                if behavior_analyzer is None or camera_id is None
+                else stack.enter_context(
+                    JsonlBehaviorWriter(
+                        args.behavior_output,
+                        _build_run_metadata(
+                            camera_id,
+                            behavior_analyzer,
+                            pipeline_config.input_path,
+                            metadata,
+                            calibration_fit,
+                        ),
+                    )
+                )
+            )
 
             processor = VideoProcessor(
                 detector=detector,
@@ -336,10 +592,163 @@ def _run_command(args: argparse.Namespace) -> int:
                 zone_analyzer=analyzer,
                 metrics_writer=metrics_writer,
                 tracking_debug_writer=tracking_debug_writer,
+                behavior_analyzer=behavior_analyzer,
+                behavior_writer=behavior_writer,
             )
             result = processor.run(source, sink)
 
     _log_completion(result, analyzer, args.metrics_output)
+    _log_behavior_completion(behavior_analyzer, args.behavior_output, result)
+    return EXIT_OK
+
+
+def _log_behavior_startup(
+    analyzer: BehaviorAnalyzer | None,
+    calibration_fit: CalibrationFit | None,
+    output_path: Path | None,
+) -> None:
+    """State plainly which coordinate space the run will measure in."""
+    if analyzer is None:
+        logger.info("Behavior:    disabled (pass --behavior-output to measure signals)")
+        return
+
+    logger.info("Behavior:    %s -> %s", analyzer.camera_id, output_path)
+    if calibration_fit is None:
+        logger.info(
+            "  space:     normalized image units (camera-local; NOT metres, "
+            "not comparable between cameras)"
+        )
+        return
+
+    quality = calibration_fit.quality
+    logger.info(
+        "  space:     venue metres (venue '%s', surface '%s')",
+        calibration_fit.calibration.venue_id,
+        calibration_fit.calibration.surface_id,
+    )
+    logger.info(
+        "  fit:       %d points, mean reprojection error %.3f m (%.2f%% of a %.1f m region)",
+        quality.point_count,
+        quality.mean_venue_error_m,
+        quality.relative_error * 100.0,
+        quality.venue_extent_m,
+    )
+
+
+def _log_behavior_completion(
+    analyzer: BehaviorAnalyzer | None,
+    output_path: Path | None,
+    result: ProcessingResult,
+) -> None:
+    if analyzer is None:
+        return
+    logger.info(
+        "Behavior signals:    %d -> %s",
+        result.behavior_signals_emitted,
+        output_path,
+    )
+    if analyzer.unprojectable_observations:
+        logger.info(
+            "  skipped:   %d observation(s) with no ground-plane position "
+            "(anchor at or beyond the calibration's horizon)",
+            analyzer.unprojectable_observations,
+        )
+
+
+def _calibration_validate_command(args: argparse.Namespace) -> int:
+    """Solve a calibration and report what is known about the fit."""
+    _configure_logging(getattr(args, "verbose", False))
+
+    fit = load_calibration_fit(args.calibration)
+    calibration = fit.calibration
+    quality = fit.quality
+
+    logger.info("Calibration: %s", args.calibration)
+    logger.info("Camera:      %s", calibration.camera_id)
+    logger.info("Venue:       %s", calibration.venue_id)
+    logger.info("Surface:     %s", calibration.surface_id)
+    logger.info("Reference:   %s", calibration.reference_frame)
+    logger.info(
+        "Points:      %d%s",
+        quality.point_count,
+        "" if calibration.is_overdetermined else "  (the minimum; see note below)",
+    )
+    logger.info("Homography:  solved")
+    logger.info("Reprojection error")
+    logger.info(
+        "  venue:     mean %.4f m, max %.4f m",
+        quality.mean_venue_error_m,
+        quality.max_venue_error_m,
+    )
+    logger.info(
+        "  image:     mean %.2f px, max %.2f px",
+        quality.mean_image_error_px,
+        quality.max_image_error_px,
+    )
+    logger.info(
+        "  relative:  %.4f (%.2f%% of the %.2f m calibrated region)",
+        quality.relative_error,
+        quality.relative_error * 100.0,
+        quality.venue_extent_m,
+    )
+    logger.info(
+        "Note:        reprojection error measures how well the fit reproduces its own "
+        "reference points. It is not a measurement of real-world accuracy, and there is "
+        "no validated threshold to compare it against."
+    )
+    if not calibration.is_overdetermined:
+        logger.info(
+            "             With exactly 4 points the fit is exact by construction, so a "
+            "near-zero error here says nothing about whether the points were measured "
+            "correctly. Add more points to get a meaningful number."
+        )
+    logger.info(
+        "             Verify the geometry visually as well: "
+        "atreides-vision calibration render --calibration %s --input <frame> --output <png>",
+        args.calibration,
+    )
+    return EXIT_OK
+
+
+def _calibration_render_command(args: argparse.Namespace) -> int:
+    """Draw a calibration onto a still for visual inspection."""
+    _configure_logging(getattr(args, "verbose", False))
+
+    fit = load_calibration_fit(args.calibration)
+    frame = read_reference_frame(args.input)
+    height, width = frame.shape[:2]
+
+    projector = GroundPlaneProjector(fit, frame_width=width, frame_height=height)
+    annotated = render_calibration_overlay(
+        frame,
+        projector,
+        CalibrationOverlayConfig(
+            grid_spacing_metres=args.grid_spacing,
+            draw_grid=not args.no_grid,
+        ),
+    )
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), annotated):
+        raise ConfigurationError(
+            f"Could not write the calibration diagnostic to {output_path}. Check the "
+            "directory is writable and the extension is one OpenCV can encode (.png, .jpg)."
+        )
+
+    logger.info("Calibration: %s (camera '%s')", args.calibration, fit.camera_id)
+    logger.info("Frame:       %s at %dx%d", args.input, width, height)
+    if projector.is_rescaling:
+        logger.info(
+            "             rescaled from the calibration reference frame %s",
+            fit.calibration.reference_frame,
+        )
+    logger.info("Grid:        %.2f m spacing", args.grid_spacing)
+    logger.info("Written:     %s", output_path)
+    logger.info(
+        "Check:       do the grid lines follow the real floor? That is the one test "
+        "reprojection error cannot perform."
+    )
     return EXIT_OK
 
 

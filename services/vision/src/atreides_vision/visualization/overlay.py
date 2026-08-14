@@ -7,14 +7,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import cv2
 import numpy as np
 
 from atreides_vision.config import VisualizationConfig
 from atreides_vision.models import Point, Track
-from atreides_vision.video.trajectories import TrajectoryStore
 from atreides_vision.visualization.layout import (
     OverlayScale,
     PanelLayout,
@@ -22,6 +21,14 @@ from atreides_vision.visualization.layout import (
     resolve_overlay_scale,
 )
 from atreides_vision.zones.models import Zone, ZoneReport, ZoneSnapshot
+
+if TYPE_CHECKING:
+    # Type-only: importing this at runtime pulls in the ``video`` package, whose
+    # ``__init__`` imports the processor, which imports this module — a cycle
+    # that only bites when ``visualization`` happens to be imported first.
+    # Annotations are strings here (``from __future__ import annotations``), so
+    # nothing needs it at runtime.
+    from atreides_vision.video.trajectories import TrajectoryStore
 
 __all__ = [
     "Annotator",

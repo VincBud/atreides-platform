@@ -37,6 +37,10 @@ class MetricsOutputError(AtreidesVisionError):
     """Raised when the zone-metrics output stream cannot be created or written."""
 
 
+class BehaviorOutputError(AtreidesVisionError):
+    """Raised when the behaviour signal stream cannot be created or written."""
+
+
 class CalibrationError(AtreidesVisionError):
     """Raised when a ground-plane calibration is missing, malformed or unusable.
 

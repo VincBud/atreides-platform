@@ -1,4 +1,4 @@
-# Atreides — V0.3.1: GROUND-PLANE CALIBRATION (in progress)
+# Atreides — V0.3.2: CALIBRATION PIPELINE (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -22,8 +22,9 @@ deliberately narrow:
     **venue-local metres** shared across cameras, so speed is `m/s` rather than frame
     fractions per second.
     See [docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md).
-
-  Neither substep is exposed through the CLI yet.
+  - **V0.3.2 — calibration pipeline.** ✅ Exposes both through the CLI, adds a versioned
+    JSONL output contract, and adds calibration validation and visual diagnostics.
+    See [docs/vision/V0.3.2_CALIBRATION_PIPELINE.md](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -112,7 +113,38 @@ uv run atreides-vision run \
   --output artifacts/zones.mp4 \
   --zones config/zones.example.json \
   --metrics-output artifacts/zone_metrics.jsonl
+
+# V0.3 — with behaviour signals (camera-local, normalized units)
+uv run atreides-vision run \
+  --input data/input/test.mp4 \
+  --output artifacts/tracked.mp4 \
+  --behavior-output artifacts/behavior.jsonl \
+  --camera-id cam_01
+
+# V0.3 — with calibrated venue metres
+uv run atreides-vision run \
+  --input data/input/test.mp4 \
+  --output artifacts/tracked.mp4 \
+  --behavior-output artifacts/behavior.jsonl \
+  --calibration config/calibration.example.json
 ```
+
+Behaviour analysis is off unless `--behavior-output` is given, and writing it changes
+nothing about the rendered video.
+
+Inspect a calibration before trusting metres from it:
+
+```bash
+uv run atreides-vision calibration validate --calibration config/calibration.example.json
+
+uv run atreides-vision calibration render \
+  --calibration config/calibration.example.json \
+  --input data/input/test.mp4 \
+  --output artifacts/calibration.png
+```
+
+`render` draws the venue grid, axes and reference points onto a frame. Do the grid
+lines follow the real floor? That is the one check reprojection error cannot perform.
 
 The first run downloads the RF-DETR Nano weights (~349 MB) to `~/.roboflow/models/`.
 Every run after that is fully offline.
@@ -133,6 +165,9 @@ Every run after that is fully offline.
 | `--zones` | off | Zone configuration JSON. Omit for plain V0.1 behaviour |
 | `--metrics-output` | off | Write zone metrics as JSON Lines. Requires `--zones` |
 | `--metrics-interval` | `1.0` | Seconds of **source** time between metric records |
+| `--behavior-output` | off | Write behaviour signals as JSON Lines. Enables behaviour analysis |
+| `--calibration` | off | Ground-plane calibration JSON. Switches signals to metres. Needs `--behavior-output` |
+| `--camera-id` | from config | Camera namespace for behaviour records |
 | `--trail-length` | `25` | Centre points kept and drawn per track |
 | `--no-confidence-labels` | off | Draw `ID <n>` without the score |
 | `--log-every` | `100` | Progress log interval, in frames |
@@ -386,14 +421,15 @@ atreides-platform/
 │   │   │   │   ├── config.py            # tunables, each with a unit and rationale
 │   │   │   │   ├── history.py           # bounded per-subject motion segments
 │   │   │   │   ├── kinematics.py        # pure formulas, no state
-│   │   │   │   └── analyzer.py          # the facade VideoProcessor orchestrates
+│   │   │   │   ├── analyzer.py          # the facade VideoProcessor orchestrates
+│   │   │   │   └── reporting.py         # V0.3.2 versioned JSONL output contract
 │   │   │   ├── calibration/         # V0.3.1 ground-plane calibration
 │   │   │   │   ├── homography.py        # normalized DLT — pure array maths
 │   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
 │   │   │   │   ├── fitting.py           # solve + measure + safeguard
 │   │   │   │   ├── projector.py         # GroundPlaneProjector (a MotionProjector)
 │   │   │   │   └── loader.py            # JSON loading and validation
-│   │   │   └── visualization/       # overlay drawing
+│   │   │   └── visualization/       # overlay drawing + calibration diagnostics
 │   │   └── tests/
 │   ├── intelligence/            # placeholder
 │   └── api/                     # placeholder
@@ -535,13 +571,28 @@ One homography describes **one plane**. Stairs, balconies, platforms and multipl
 floors are not supported. No calibration has been validated against a real measured
 venue — every number above is synthetic geometry.
 
+### V0.3.2 — calibration pipeline
+
+V0.3.2 makes all of the above reachable from the runtime. `--behavior-output` turns
+behaviour analysis on; `--calibration` switches it from frame fractions to venue
+metres. Signals leave the process as **versioned JSONL** (`schema_version 0.3.2`),
+one record per subject per frame, carrying position, units, coordinate space and
+calibration provenance — so a future intelligence layer consumes structured data
+rather than parsing logs.
+
 Behaviour analysis attaches to `VideoProcessor` as an optional collaborator, exactly
-as zones do, and is measurement-only: with one attached the rendered output is
-byte-identical. **There is still no CLI flag** for either substep.
+as zones do, and is measurement-only: with it enabled the rendered video is
+**byte-identical**. Nothing is drawn.
+
+Two calibration inspection commands were added: `calibration validate` reports the
+fit numerically (with no GOOD/BAD verdict — no validated threshold exists), and
+`calibration render` draws the venue grid onto a frame, which is the only check that
+can catch a reference point measured against the wrong spot.
 
 Full detail and the complete limitation lists:
 [V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
-[V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md).
+[V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md) ·
+[V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.

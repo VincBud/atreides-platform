@@ -23,10 +23,10 @@ geometry and elapsed time only.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, Self
 
 from atreides_vision.behavior.coordinates import MotionPoint, MotionSpace
 from atreides_vision.models import BoundingBox
@@ -35,6 +35,7 @@ __all__ = [
     "BehaviorFrame",
     "BehaviorObservation",
     "BehaviorSignal",
+    "BehaviorSubjectSnapshot",
     "SignalType",
     "SubjectRef",
     "unit_for",
@@ -232,12 +233,96 @@ class BehaviorSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class BehaviorSubjectSnapshot:
+    """One subject, at one frame: where it was, and what was measured about it.
+
+    Deliberately keeps the **observation** (a projected position, which is a
+    fact about this frame alone) separate from the **derived signals** (which
+    are statements about a window of frames). Collapsing the two into one record
+    type would make it impossible to tell "we saw this person here" from "we
+    computed this about their recent movement".
+
+    ``signals`` may be empty, and an empty snapshot is meaningful: a track
+    observed for the first time has a perfectly good position but not yet
+    enough history for any rate to exist.
+    """
+
+    subject: SubjectRef
+    frame_index: int
+    timestamp_seconds: float
+    #: Where the subject's anchor projected to, in :attr:`space`.
+    position: MotionPoint
+    signals: tuple[BehaviorSignal, ...] = field(default_factory=tuple)
+    #: Opaque zone context supplied by the caller, never interpreted here.
+    zone_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.frame_index < 0:
+            raise ValueError(
+                "BehaviorSubjectSnapshot.frame_index must be non-negative, "
+                f"got {self.frame_index!r}"
+            )
+
+    @property
+    def space(self) -> MotionSpace:
+        """The coordinate space the position and distance signals are in."""
+        return self.position.space
+
+    def value_for(self, signal_type: SignalType) -> float | None:
+        """This subject's value for one signal type, or ``None`` if not emitted."""
+        for signal in self.signals:
+            if signal.signal_type is signal_type:
+                return signal.value
+        return None
+
+    def __len__(self) -> int:
+        return len(self.signals)
+
+
+@dataclass(frozen=True, slots=True)
 class BehaviorFrame:
-    """Every signal produced for one frame, in stable subject order."""
+    """Every signal produced for one frame, in stable subject order.
+
+    ``signals`` is the flat V0.3.0 view and remains the primary accessor.
+    ``snapshots`` groups the same signals by subject and adds each subject's
+    projected position, which is what the V0.3.2 output contract serialises.
+    Build with :meth:`from_snapshots` so the two can never disagree.
+    """
 
     frame_index: int
     timestamp_seconds: float
     signals: tuple[BehaviorSignal, ...] = field(default_factory=tuple)
+    #: Per-subject observations for this frame, in track order. Empty on frames
+    #: constructed directly from signals alone.
+    snapshots: tuple[BehaviorSubjectSnapshot, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def from_snapshots(
+        cls,
+        frame_index: int,
+        timestamp_seconds: float,
+        snapshots: Sequence[BehaviorSubjectSnapshot],
+    ) -> Self:
+        """Build a frame from per-subject snapshots, deriving the flat signal view.
+
+        The single construction path used by the analyzer, so ``signals`` is
+        always exactly the concatenation of the snapshots' signals, in the same
+        order.
+        """
+        ordered = tuple(snapshots)
+        return cls(
+            frame_index=frame_index,
+            timestamp_seconds=timestamp_seconds,
+            signals=tuple(signal for snapshot in ordered for signal in snapshot.signals),
+            snapshots=ordered,
+        )
+
+    def snapshot_for(self, subject: SubjectRef) -> BehaviorSubjectSnapshot | None:
+        """This subject's snapshot for the frame, or ``None`` if it was not seen."""
+        for snapshot in self.snapshots:
+            if snapshot.subject == subject:
+                return snapshot
+        return None
 
     def for_subject(self, subject: SubjectRef) -> tuple[BehaviorSignal, ...]:
         return tuple(signal for signal in self.signals if signal.subject == subject)
