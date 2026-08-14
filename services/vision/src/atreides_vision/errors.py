@@ -37,6 +37,31 @@ class MetricsOutputError(AtreidesVisionError):
     """Raised when the zone-metrics output stream cannot be created or written."""
 
 
+class CalibrationError(AtreidesVisionError):
+    """Raised when a ground-plane calibration is missing, malformed or unusable.
+
+    Covers configuration problems (too few correspondences, mismatched counts,
+    non-finite values) and geometric ones (collinear or duplicate points, a
+    singular transform, a fit whose reprojection error is grossly wrong).
+
+    A calibration that cannot be trusted is always an error. Falling back to
+    normalized image coordinates would silently change the unit of every
+    downstream signal from metres to frame fractions, which is far worse than
+    stopping.
+    """
+
+
+class ProjectionError(CalibrationError):
+    """Raised when a specific point cannot be projected onto the ground plane.
+
+    Distinct from a bad calibration: the calibration may be perfectly good and
+    the *point* still have no ground position — anchors at or beyond the
+    horizon line project to infinity or to the mirrored side of it. Callers
+    that process many points per frame catch this narrowly and skip the point
+    rather than aborting.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 

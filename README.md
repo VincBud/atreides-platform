@@ -1,4 +1,4 @@
-# Atreides — V0.3: BEHAVIOR SIGNALS (in progress)
+# Atreides — V0.3.1: GROUND-PLANE CALIBRATION (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -13,11 +13,17 @@ deliberately narrow:
   defaults by measurement on three materially different fixed cameras.
   Verdict: **PASS WITH DOCUMENTED LIMITATIONS** —
   see [docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md](docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md).
-- **V0.3 — BEHAVIOR SIGNALS.** 🔄 In progress. Substep **V0.3.0 (behaviour signal
-  foundation)** is built: neutral kinematic signals — speed, acceleration, turn rate,
-  stationary duration — measured in an abstract coordinate space rather than pixels.
-  See [docs/vision/V0.3_BEHAVIOR_SIGNALS.md](docs/vision/V0.3_BEHAVIOR_SIGNALS.md).
-  Not yet exposed through the CLI.
+- **V0.3 — BEHAVIOR SIGNALS.** 🔄 In progress.
+  - **V0.3.0 — behaviour signal foundation.** ✅ Neutral kinematic signals — speed,
+    acceleration, turn rate, stationary duration — measured in an abstract coordinate
+    space rather than pixels.
+    See [docs/vision/V0.3_BEHAVIOR_SIGNALS.md](docs/vision/V0.3_BEHAVIOR_SIGNALS.md).
+  - **V0.3.1 — ground-plane calibration.** ✅ Turns camera-local image positions into
+    **venue-local metres** shared across cameras, so speed is `m/s` rather than frame
+    fractions per second.
+    See [docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md).
+
+  Neither substep is exposed through the CLI yet.
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -340,6 +346,13 @@ isolation, and — the important one — **resolution invariance**: the same tra
 at 384×288 and 1920×1080 must produce identical signals, where a pixel-based
 measurement would have differed fivefold.
 
+V0.3.1 adds homography estimation against synthetic cameras with known geometry,
+degeneracy rejection, runtime-resolution rescaling, and two proofs that matter:
+**perspective correction** (the same physical metre measured 2.1× differently in
+image space, 1.000× after calibration) and **multi-camera agreement** (two cameras
+with different geometry and resolution reporting the same speed to 4×10⁻¹⁵ m/s,
+while their observations stay strictly separate).
+
 ## Architecture
 
 ```text
@@ -367,13 +380,19 @@ atreides-platform/
 │   │   │   │   ├── metrics.py           # motion level, snapshot assembly
 │   │   │   │   ├── analyzer.py          # the facade VideoProcessor orchestrates
 │   │   │   │   └── reporting.py         # JSONL metrics stream
-│   │   │   ├── behavior/            # V0.3 behaviour signals
+│   │   │   ├── behavior/            # V0.3.0 behaviour signals
 │   │   │   │   ├── coordinates.py       # MotionSpace, projectors — never raw pixels
 │   │   │   │   ├── models.py            # SubjectRef, BehaviorObservation, BehaviorSignal
 │   │   │   │   ├── config.py            # tunables, each with a unit and rationale
 │   │   │   │   ├── history.py           # bounded per-subject motion segments
 │   │   │   │   ├── kinematics.py        # pure formulas, no state
 │   │   │   │   └── analyzer.py          # the facade VideoProcessor orchestrates
+│   │   │   ├── calibration/         # V0.3.1 ground-plane calibration
+│   │   │   │   ├── homography.py        # normalized DLT — pure array maths
+│   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
+│   │   │   │   ├── fitting.py           # solve + measure + safeguard
+│   │   │   │   ├── projector.py         # GroundPlaneProjector (a MotionProjector)
+│   │   │   │   └── loader.py            # JSON loading and validation
 │   │   │   └── visualization/       # overlay drawing
 │   │   └── tests/
 │   ├── intelligence/            # placeholder
@@ -457,7 +476,10 @@ V0.2 added no dependencies. Point-in-polygon is ~20 lines of ray casting rather 
 a geometry library, which keeps the boundary contract ours to define and test.
 
 V0.3 added none either — the behaviour package uses only the standard library, and
-not even NumPy or OpenCV.
+not even NumPy or OpenCV. V0.3.1's calibration package uses NumPy for the one-off
+homography solve and plain arithmetic per point; homography estimation is ~40 lines
+of normalized DLT rather than a call into OpenCV, for the same reason
+point-in-polygon is ours.
 
 Dev: `pytest`, `ruff`, `mypy`. Deliberately absent: Ultralytics, cloud SDKs, database
 libraries, web frameworks, Docker.
@@ -465,7 +487,8 @@ libraries, web frameworks, Docker.
 ## Current milestone — V0.3: BEHAVIOR SIGNALS
 
 V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
-behaviour signals — and **V0.3.0, the signal foundation, is built**.
+behaviour signals. **V0.3.0 (the signal foundation) and V0.3.1 (ground-plane
+calibration) are both built.**
 
 Four neutral measurements per tracked subject per frame: `speed`, `acceleration`,
 `heading_change_rate` and `stationary_duration`. Each carries its subject, timestamp,
@@ -475,24 +498,50 @@ score or judgement.
 The point of the milestone is the architecture underneath. Behaviour maths never
 touches a pixel: an injectable `MotionProjector` converts a person's bottom-centre
 anchor into an abstract `MotionSpace`, so nothing encodes a venue size, a camera
-coverage area, a mounting height or a resolution. V0.3.0 ships one projector —
-normalized image coordinates, which are **resolution-independent but camera-local**.
-Its values are not metres, and two arbitrary cameras' values are not comparable.
-A calibrated ground-plane projector is the planned next step and needs no change to
-any signal.
+coverage area, a mounting height or a resolution.
+
+### V0.3.1 — ground-plane calibration
+
+That abstraction is what made **V0.3.1** cheap. Four or more operator-supplied
+correspondences — *"this pixel is that spot on the floor"* — determine a planar
+homography, and `GroundPlaneProjector` implements the same `MotionProjector`
+protocol. **No kinematics, history or signal code changed:** speed simply starts
+arriving in `m/s` and acceleration in `m/s²`, because units are derived from the
+coordinate space rather than hard-coded.
+
+Why it was necessary, measured on a synthetic camera — one person, walking exactly
+one metre in one second, at two depths in the same shot:
+
+| | Near the camera | Far from the camera |
+| --- | --- | --- |
+| Normalized image speed | `0.0436` frame-widths/s | `0.0206` frame-widths/s |
+| Calibrated ground plane | **`1.000 m/s`** | **`1.000 m/s`** |
+
+Image space disagrees with itself by **2.1×** for the same physical metre. That is
+why a normalized threshold silently encodes one camera and one spot on its floor.
+
+Venue coordinates are **shared across cameras**: the operator picks one origin for
+the venue and expresses every camera's reference points in it. Two synthetic cameras
+with different geometry, different lenses and different resolutions report the same
+walk to within `4×10⁻¹⁵ m/s`.
+
+**Spatial agreement is not identity.** Two cameras placing someone at the same
+coordinates are two independent observations — `(cam_a, 7)` and `(cam_b, 7)` remain
+two distinct subjects, and nothing associates them. A camera-local track ID is still
+not a unique venue person: that is limitation (2) from the V0.2.1 report, unfixed
+and not pretended otherwise.
+
+One homography describes **one plane**. Stairs, balconies, platforms and multiple
+floors are not supported. No calibration has been validated against a real measured
+venue — every number above is synthetic geometry.
 
 Behaviour analysis attaches to `VideoProcessor` as an optional collaborator, exactly
 as zones do, and is measurement-only: with one attached the rendered output is
-byte-identical. **There is no CLI flag yet** — that arrives with V0.3.1 alongside a
-signal output stream.
+byte-identical. **There is still no CLI flag** for either substep.
 
-The binding constraint it inherits is limitation (2) from the V0.2.1 report: a
-unique track ID is not a unique person. V0.3.0 does not fix it and does not pretend
-to — every signal carries a `(camera_id, track_id)` subject reference rather than a
-bare id, so a future fusion layer can map them without rewriting any algorithm.
-
-Full detail, including the complete limitation list:
-[docs/vision/V0.3_BEHAVIOR_SIGNALS.md](docs/vision/V0.3_BEHAVIOR_SIGNALS.md).
+Full detail and the complete limitation lists:
+[V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
+[V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.

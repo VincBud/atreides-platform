@@ -49,6 +49,7 @@ from atreides_vision.behavior.models import (
     SignalType,
     SubjectRef,
 )
+from atreides_vision.errors import ConfigurationError, ProjectionError
 from atreides_vision.models import Track
 
 logger = logging.getLogger(__name__)
@@ -66,11 +67,17 @@ class BehaviorAnalyzer:
         projector: Converts image-space anchors into the analysis coordinate
             space. Pass a
             :class:`~atreides_vision.behavior.coordinates.NormalizedFrameProjector`
-            built from the source resolution; a calibrated projector can be
-            substituted later with no other change.
+            built from the source resolution, or a calibrated
+            ``GroundPlaneProjector`` for venue metres — the analyzer neither
+            knows nor cares which, beyond checking the config agrees.
         config: Windows, thresholds and memory bounds. Development defaults.
         anchor: How a box becomes a point. Defaults to bottom-centre, the
             same floor convention the zone layer uses.
+
+    Raises:
+        ConfigurationError: if ``config`` declares an
+            :attr:`~atreides_vision.behavior.config.BehaviorAnalysisConfig.intended_space`
+            that ``projector`` does not emit.
     """
 
     def __init__(
@@ -89,6 +96,27 @@ class BehaviorAnalyzer:
         self._history = SubjectHistoryStore(self._config)
         self._latest: BehaviorFrame | None = None
         self._signals_emitted = 0
+        self._unprojectable_observations = 0
+        self._require_matching_space()
+
+    def _require_matching_space(self) -> None:
+        """Refuse a config whose distance thresholds are in the wrong space.
+
+        Catching this at construction matters because the failure is otherwise
+        silent and total: normalized thresholds under a metric projector mean
+        nobody is ever stationary, and metric thresholds under a normalized one
+        mean everybody always is. Both produce a full stream of confident,
+        wrong signals rather than an error.
+        """
+        intended = self._config.intended_space
+        actual = self._projector.space
+        if intended is not None and intended is not actual:
+            raise ConfigurationError(
+                f"Behaviour configuration is written for {intended.value} coordinates but the "
+                f"projector emits {actual.value}. Distance thresholds would be interpreted in "
+                f"the wrong unit. Use BehaviorAnalysisConfig.for_ground_plane_metres() with a "
+                f"calibrated projector, or the defaults with a normalized one."
+            )
 
     @property
     def camera_id(self) -> str:
@@ -117,6 +145,17 @@ class BehaviorAnalyzer:
     def tracked_subjects(self) -> int:
         """Subjects currently holding history."""
         return len(self._history)
+
+    @property
+    def unprojectable_observations(self) -> int:
+        """Anchors skipped this session for having no ground-plane position.
+
+        Always ``0`` for a normalized projector, which has no horizon. A
+        persistently high count under a calibrated one means people are being
+        detected above the calibrated floor area — often a sign the reference
+        points cover only part of the view.
+        """
+        return self._unprojectable_observations
 
     def update(
         self,
@@ -148,11 +187,30 @@ class BehaviorAnalyzer:
             subject = SubjectRef(camera_id=self._camera_id, track_id=track.track_id)
             zone_ids = tuple(zone_ids_by_track.get(track.track_id, ())) if zone_ids_by_track else ()
 
+            try:
+                position = self._projector.project(self._anchor(track.bbox_xyxy))
+            except ProjectionError:
+                # A calibrated projector has a horizon: an anchor at or beyond
+                # it has no ground position at all. That is a property of the
+                # single point, not of the calibration, so one such detection
+                # must not end a run of thousands of frames. The track is
+                # skipped for this frame and no signal is invented for it —
+                # the same rule the rest of the analyzer follows when it cannot
+                # measure something. Caught narrowly: any other failure is a
+                # real fault and still propagates.
+                self._unprojectable_observations += 1
+                logger.debug(
+                    "Skipping %s at frame %d: anchor has no ground-plane position",
+                    subject,
+                    frame_index,
+                )
+                continue
+
             observation = BehaviorObservation(
                 subject=subject,
                 frame_index=frame_index,
                 timestamp_seconds=timestamp_seconds,
-                position=self._projector.project(self._anchor(track.bbox_xyxy)),
+                position=position,
                 bbox=track.bbox_xyxy,
                 confidence=track.confidence,
                 zone_ids=zone_ids,

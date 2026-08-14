@@ -70,7 +70,7 @@ class TestValidation:
     @pytest.mark.parametrize("value", [0, -5])
     def test_rejects_non_positive_counts(self, field: str, value: int) -> None:
         with pytest.raises(ConfigurationError, match=f"{field} must be >= 1"):
-            BehaviorAnalysisConfig(**{field: value})
+            BehaviorAnalysisConfig(**{field: value})  # type: ignore[arg-type]
 
     def test_rejects_a_history_window_shorter_than_a_signal_window(self) -> None:
         """Otherwise a signal is silently computed over less history than configured."""

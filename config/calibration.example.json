@@ -1,0 +1,18 @@
+{
+  "camera_id": "cam_01",
+  "venue_id": "example_venue",
+  "surface_id": "ground",
+  "description": "SYNTHETIC EXAMPLE ONLY - these numbers are invented to show the file format. They are NOT measurements of any real venue and must NOT be used to produce metric results. Replace every value with points you have actually measured on your own floor before trusting a single metre reported by this calibration.",
+  "reference_frame": {
+    "width": 1920,
+    "height": 1080
+  },
+  "correspondences": [
+    { "image": [512.0, 1010.0], "venue": [0.0, 0.0] },
+    { "image": [1422.0, 1010.0], "venue": [6.0, 0.0] },
+    { "image": [1235.0, 604.0], "venue": [6.0, 9.0] },
+    { "image": [699.0, 604.0], "venue": [0.0, 9.0] },
+    { "image": [967.0, 754.5], "venue": [3.0, 4.5] },
+    { "image": [811.7, 696.4], "venue": [1.5, 6.0] }
+  ]
+}

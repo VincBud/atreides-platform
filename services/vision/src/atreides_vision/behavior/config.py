@@ -5,9 +5,17 @@ behind it. No algorithm in this package contains a bare constant.
 
 **Units follow the active coordinate space.** Thresholds expressed in
 "distance units" are in whatever :class:`~atreides_vision.behavior.coordinates.MotionSpace`
-the projector emits — normalized frame units in V0.3.0, calibrated metres if a
-ground-plane projector is added later. A configuration tuned against normalized
-image motion is therefore **not** valid for a metric projector, and vice versa.
+the projector emits — normalized frame units by default, calibrated metres
+behind a ground-plane projector. A configuration tuned against normalized image
+motion is **not** valid for a metric projector, and vice versa: 0.02 frame
+widths per second and 0.02 metres per second are wildly different speeds.
+
+That mistake is silent and severe — normalized thresholds under a metric
+projector make nobody ever count as stationary — so two things guard it. The
+class defaults are normalized, :meth:`BehaviorAnalysisConfig.for_ground_plane_metres`
+supplies a metric set, and :attr:`BehaviorAnalysisConfig.intended_space` lets a
+config declare which space it was written for so the analyzer can refuse a
+mismatched projector.
 
 **These are DEVELOPMENT defaults.** They were chosen to be reasonable and to
 make the signals testable, not by validation against real venue footage. Unlike
@@ -18,7 +26,9 @@ not safety thresholds and must not be treated as any.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Self
 
+from atreides_vision.behavior.coordinates import MotionSpace
 from atreides_vision.errors import ConfigurationError
 
 __all__ = ["BehaviorAnalysisConfig"]
@@ -85,6 +95,41 @@ class BehaviorAnalysisConfig:
     #: Hard ceiling on simultaneously retained subjects, as a second bound.
     #: The least-recently-seen are evicted first.
     max_tracked_subjects: int = 1024
+
+    #: The coordinate space this configuration's distance thresholds were
+    #: written for, or ``None`` to make no claim. When set, the analyzer
+    #: refuses a projector emitting a different space rather than silently
+    #: comparing metres against frame fractions. ``None`` by default so
+    #: existing configurations behave exactly as before.
+    intended_space: MotionSpace | None = None
+
+    @classmethod
+    def for_ground_plane_metres(cls) -> Self:
+        """Development defaults for calibrated metric coordinates.
+
+        The class defaults are normalized-image values and are meaningless
+        under a ground-plane projector: ``0.02`` frame widths per second is a
+        plausible standing-still threshold, ``0.02`` metres per second is 2 cm/s
+        and nobody would ever exceed it.
+
+        The metric values keep the same relationship the normalized pair has —
+        the heading floor is the distance a subject at the stationary threshold
+        covers in half a window — so the two sets behave alike, just in their
+        own units. For scale, a walk is roughly 1.4 m/s.
+
+        Like every other default here these are **development** values with no
+        measurement behind them, and the stationary threshold in particular
+        depends on how much a tracked box jitters on a given camera.
+        """
+        return cls(
+            #: 0.20 m/s: slow enough that a standing person's box jitter stays
+            #: under it, fast enough to be well below a walk.
+            stationary_speed_threshold=0.20,
+            #: 0.10 m of net travel before a direction is considered defined —
+            #: what 0.20 m/s covers in half a one-second window.
+            min_heading_displacement=0.10,
+            intended_space=MotionSpace.GROUND_PLANE_METRES,
+        )
 
     def __post_init__(self) -> None:
         for name, value in (
