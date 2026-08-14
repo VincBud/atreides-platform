@@ -13,9 +13,31 @@ from pathlib import Path
 
 import pytest
 
-from atreides_vision.cli import EXIT_ERROR, EXIT_OK, build_parser, main
-from atreides_vision.config import Device
-from atreides_vision.errors import DeviceUnavailableError, VideoSourceError
+from atreides_vision.cli import (
+    EXIT_ERROR,
+    EXIT_OK,
+    _build_tracker_config,
+    build_parser,
+    build_tracker,
+    main,
+)
+from atreides_vision.config import (
+    DEFAULT_DETECTION_CONFIDENCE,
+    DEFAULT_OCSORT_HIGH_CONF_THRESHOLD,
+    DEFAULT_TRACKER,
+    Device,
+    PipelineConfig,
+    Tracker,
+    TrackerConfig,
+)
+from atreides_vision.errors import (
+    ConfigurationError,
+    DeviceUnavailableError,
+    VideoSourceError,
+)
+from atreides_vision.tracking.base import MultiObjectTracker
+from atreides_vision.tracking.bytetrack import ByteTrackTracker
+from atreides_vision.tracking.ocsort import OcSortTracker
 
 
 class TestParser:
@@ -42,7 +64,7 @@ class TestParser:
         )
         assert args.input == Path("data/input/test.mp4")
         assert args.output == Path("artifacts/tracked.mp4")
-        assert args.confidence == 0.5
+        assert args.confidence == DEFAULT_DETECTION_CONFIDENCE
         assert args.device is Device.AUTO
 
     def test_input_and_output_are_required(self) -> None:
@@ -150,6 +172,198 @@ class TestZoneFlags:
         out = capsys.readouterr().out
         for flag in ("--zones", "--metrics-output", "--metrics-interval"):
             assert flag in out
+
+
+class TestTrackerSelection:
+    def test_default_is_ocsort(self) -> None:
+        """V0.2.1 promoted OC-SORT to the default after three-scene validation."""
+        args = build_parser().parse_args(["run", "--input", "a.mp4", "--output", "b.mp4"])
+        assert args.tracker is Tracker.OCSORT
+        assert args.tracker is DEFAULT_TRACKER
+
+    def test_default_builds_the_ocsort_adapter(self) -> None:
+        args = build_parser().parse_args(["run", "--input", "a.mp4", "--output", "b.mp4"])
+        tracker = build_tracker(args.tracker, TrackerConfig())
+        assert isinstance(tracker, OcSortTracker)
+        assert tracker.name == "OC-SORT"
+
+    def test_bytetrack_remains_selectable_and_builds(self) -> None:
+        """Promoting OC-SORT must not remove the ByteTrack path."""
+        args = build_parser().parse_args(
+            ["run", "--input", "a.mp4", "--output", "b.mp4", "--tracker", "bytetrack"]
+        )
+        assert args.tracker is Tracker.BYTETRACK
+        tracker = build_tracker(args.tracker, TrackerConfig())
+        assert isinstance(tracker, ByteTrackTracker)
+        assert tracker.name == "ByteTrack"
+
+    def test_accepts_ocsort(self) -> None:
+        args = build_parser().parse_args(
+            ["run", "--input", "a.mp4", "--output", "b.mp4", "--tracker", "ocsort"]
+        )
+        assert args.tracker is Tracker.OCSORT
+
+    def test_ocsort_builds_the_ocsort_adapter(self) -> None:
+        tracker = build_tracker(Tracker.OCSORT, TrackerConfig())
+        assert isinstance(tracker, OcSortTracker)
+        assert tracker.name == "OC-SORT"
+
+    def test_accepts_bytetrack_explicitly(self) -> None:
+        args = build_parser().parse_args(
+            ["run", "--input", "a.mp4", "--output", "b.mp4", "--tracker", "bytetrack"]
+        )
+        assert args.tracker is Tracker.BYTETRACK
+
+    def test_rejects_an_unknown_tracker(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["run", "--input", "a.mp4", "--output", "b.mp4", "--tracker", "deepsort"]
+            )
+        assert "invalid" in capsys.readouterr().err.lower()
+
+    def test_both_trackers_satisfy_the_same_interface(self) -> None:
+        """The A/B swap is one argument precisely because of this."""
+        for choice in (Tracker.BYTETRACK, Tracker.OCSORT):
+            assert isinstance(build_tracker(choice, TrackerConfig()), MultiObjectTracker)
+
+    def test_tracking_debug_defaults_to_off(self) -> None:
+        args = build_parser().parse_args(["run", "--input", "a.mp4", "--output", "b.mp4"])
+        assert args.tracking_debug_output is None
+
+    def test_accepts_tracking_debug_output(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--input",
+                "a.mp4",
+                "--output",
+                "b.mp4",
+                "--tracker",
+                "ocsort",
+                "--tracking-debug-output",
+                "artifacts/tracking-debug-ocsort.jsonl",
+            ]
+        )
+        assert args.tracking_debug_output == Path("artifacts/tracking-debug-ocsort.jsonl")
+        assert args.tracker is Tracker.OCSORT
+
+    def test_run_help_lists_the_tracking_debug_flag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        assert "--tracking-debug-output" in capsys.readouterr().out
+
+    def test_ocsort_high_conf_override_defaults_to_off(self) -> None:
+        """Omitting the flag must leave the permanent default in place."""
+        args = build_parser().parse_args(["run", "--input", "a.mp4", "--output", "b.mp4"])
+        assert args.ocsort_high_conf_threshold is None
+        assert _build_tracker_config(30.0, args.ocsort_high_conf_threshold) == TrackerConfig(
+            frame_rate=30.0
+        )
+        assert (
+            _build_tracker_config(30.0, None).high_conf_det_threshold
+            == DEFAULT_OCSORT_HIGH_CONF_THRESHOLD
+        )
+
+    def test_ocsort_high_conf_override_is_applied(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--input",
+                "a.mp4",
+                "--output",
+                "b.mp4",
+                "--tracker",
+                "ocsort",
+                "--ocsort-high-conf-threshold",
+                "0.30",
+            ]
+        )
+        assert args.ocsort_high_conf_threshold == 0.30
+        config = _build_tracker_config(30.0, args.ocsort_high_conf_threshold)
+        assert config.high_conf_det_threshold == 0.30
+
+    def test_override_changes_nothing_else(self) -> None:
+        """The experiment must move exactly one knob."""
+        baseline = _build_tracker_config(30.0, None)
+        overridden = _build_tracker_config(30.0, 0.55)
+        assert overridden.high_conf_det_threshold == 0.55
+        assert baseline.high_conf_det_threshold == DEFAULT_OCSORT_HIGH_CONF_THRESHOLD
+        for field in (
+            "frame_rate",
+            "lost_track_buffer",
+            "minimum_consecutive_frames",
+            "minimum_iou_threshold",
+            "ocsort_minimum_iou_threshold",
+            "direction_consistency_weight",
+            "delta_t",
+            "track_activation_threshold",
+        ):
+            assert getattr(overridden, field) == getattr(baseline, field), field
+
+    def test_override_is_rejected_when_out_of_range(self) -> None:
+        with pytest.raises(ConfigurationError, match="high_conf_det_threshold"):
+            _build_tracker_config(30.0, 1.5)
+
+    def test_run_help_lists_the_ocsort_override(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        assert "--ocsort-high-conf-threshold" in capsys.readouterr().out
+
+    def test_deduplication_defaults_to_on(self) -> None:
+        """V0.2.1 promoted Rule-B3 deduplication to the default."""
+        args = build_parser().parse_args(["run", "--input", "a.mp4", "--output", "b.mp4"])
+        assert args.deduplicate_detections is True
+        assert PipelineConfig(Path("a.mp4"), Path("b.mp4")).deduplicate_detections is True
+
+    def test_deduplication_flag_still_accepted(self) -> None:
+        """The pre-V0.2.1 opt-in flag must keep working for existing scripts."""
+        args = build_parser().parse_args(
+            ["run", "--input", "a.mp4", "--output", "b.mp4", "--deduplicate-detections"]
+        )
+        assert args.deduplicate_detections is True
+
+    def test_deduplication_can_be_disabled(self) -> None:
+        args = build_parser().parse_args(
+            ["run", "--input", "a.mp4", "--output", "b.mp4", "--no-deduplicate-detections"]
+        )
+        assert args.deduplicate_detections is False
+
+    def test_run_help_lists_the_deduplication_flag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        assert "--deduplicate-detections" in capsys.readouterr().out
+
+    def test_run_help_lists_the_tracker_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        out = capsys.readouterr().out
+        assert "--tracker" in out
+        assert "bytetrack" in out
+        assert "ocsort" in out
+
+    def test_documented_ocsort_invocation_parses(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--input",
+                "data/input/validation/control_baseline_01.mp4",
+                "--output",
+                "artifacts/validation-baseline-ocsort.mp4",
+                "--zones",
+                "config/zones.example.json",
+                "--metrics-output",
+                "artifacts/validation-baseline-ocsort.jsonl",
+                "--tracker",
+                "ocsort",
+            ]
+        )
+        assert args.tracker is Tracker.OCSORT
+        assert args.zones == Path("config/zones.example.json")
+        assert args.metrics_output == Path("artifacts/validation-baseline-ocsort.jsonl")
 
 
 class TestErrorSurfacing:

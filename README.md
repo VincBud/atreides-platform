@@ -1,14 +1,23 @@
-# Atreides — V0.2: ZONES + CROWD METRICS
+# Atreides — V0.2.1: FIXED-CCTV VALIDATION
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
 
-**This repository contains the first two technical milestones.** They are
+**This repository contains the first three technical milestones.** They are
 deliberately narrow:
 
-- **V0.1 — SEE + TRACK.** Find people in a video and follow them frame to frame.
-- **V0.2 — UNDERSTAND WHERE ACTIVITY OCCURS.** Measure crowd activity inside
+- **V0.1 — SEE + TRACK.** ✅ Find people in a video and follow them frame to frame.
+- **V0.2 — UNDERSTAND WHERE ACTIVITY OCCURS.** ✅ Measure crowd activity inside
   operator-defined regions of the camera view.
+- **V0.2.1 — FIXED-CCTV VALIDATION.** ✅ Choose and justify the detector/tracker
+  defaults by measurement on three materially different fixed cameras.
+  Verdict: **PASS WITH DOCUMENTED LIMITATIONS** —
+  see [docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md](docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md).
+- **V0.3 — BEHAVIOR SIGNALS.** ⬜ Next.
+
+> **Read the V0.2.1 limitations before trusting any count.** In particular, a
+> unique track ID is *not* a unique person: same-person ID multiplicity means the
+> unique-ID count is an upper bound, not a census.
 
 ## What it does
 
@@ -101,8 +110,12 @@ Every run after that is fully offline.
 | --- | --- | --- |
 | `--input` | required | Source video path |
 | `--output` | required | Annotated MP4 destination |
-| `--confidence` | `0.5` | Minimum detection confidence, in `(0, 1]` |
+| `--confidence` | `0.30` | Minimum detection confidence, in `(0, 1]` (V0.2.1 validated) |
 | `--device` | `auto` | `auto`, `cpu`, `mps`, or `cuda` |
+| `--tracker` | `ocsort` | Tracker implementation: `ocsort` or `bytetrack` |
+| `--deduplicate-detections` | on | Rule-B3 duplicate suppression. `--no-deduplicate-detections` disables |
+| `--ocsort-high-conf-threshold` | `0.30` | Confidence above which OC-SORT may start a track |
+| `--tracking-debug-output` | off | Per-frame tracker internals as JSON Lines (observational) |
 | `--max-frames` | all | Stop after N frames — useful for a quick look at a long video |
 | `--zones` | off | Zone configuration JSON. Omit for plain V0.1 behaviour |
 | `--metrics-output` | off | Write zone metrics as JSON Lines. Requires `--zones` |
@@ -124,6 +137,29 @@ uv run atreides-vision run --input in.mp4 --output out.mp4 --device cuda
 ```
 
 Expect single-digit FPS on CPU. This milestone is about correctness, not throughput.
+
+### Choosing a tracker
+
+OC-SORT is the default since V0.2.1. It scores association on direction consistency
+as well as IoU, and recovers a track from its last observation before a gap rather
+than from a drifted Kalman prediction — which is what ByteTrack could not do when a
+person briefly occluded by someone else came back with a new track id.
+
+ByteTrack remains fully supported:
+
+```bash
+uv run atreides-vision run --input in.mp4 --output out.mp4 --tracker bytetrack
+```
+
+Note that ByteTrack's own `track_activation_threshold` is still `0.50`, so combined
+with the `0.30` detector default it will not start tracks from detections scoring
+between 0.30 and 0.50. That is ByteTrack's baseline, left untouched by V0.2.1.
+
+Both are motion-only. Neither computes appearance descriptors, and neither uses
+pixels for identity, so the privacy boundaries above hold for either choice.
+Because they sit behind the same `MultiObjectTracker` interface and share one
+conversion layer, swapping them changes the tracker and nothing else — which is
+what makes an A/B on the same clip meaningful.
 
 ## Zones
 
@@ -398,13 +434,17 @@ a geometry library, which keeps the boundary contract ours to define and test.
 Dev: `pytest`, `ruff`, `mypy`. Deliberately absent: Ultralytics, cloud SDKs, database
 libraries, web frameworks, Docker.
 
-## Next milestone
+## Next milestone — V0.3: BEHAVIOR SIGNALS
 
-The most useful V0.3 is **calibration and tracking quality**, because both current
-metrics rest on them: a homography from four floor reference points would turn
-image-plane speed into real floor distance and make zones robust to camera framing,
-and better ID persistence would stop entry counts inflating when the tracker drops a
-box. Per-camera tuning of `motion_reference_speed` belongs there too.
+V0.2.1 closed the question of *which* configuration to run and documented what is
+known about it. V0.3 turns tracks into behaviour signals.
+
+The binding constraint it inherits is limitation (2) from the V0.2.1 report: a
+unique track ID is not a unique person, so any occupancy- or footfall-derived
+signal built on ID counts will over-count until ID persistence improves.
+Calibration belongs here too — a homography from four floor reference points would
+turn image-plane speed into real floor distance and make zones robust to camera
+framing. Per-camera tuning of `motion_reference_speed` belongs there as well.
 
 Identity, biometrics, demographics and cross-camera matching remain out of scope by
 design.

@@ -1,8 +1,12 @@
 """Command-line entry point for Atreides Vision.
 
 This module is the composition root: the one place that picks concrete
-implementations (RF-DETR Nano, ByteTrack) and wires them into the pipeline.
-Everything below it depends only on Atreides interfaces.
+implementations (RF-DETR Nano, OC-SORT or ByteTrack) and wires them into the
+pipeline. Everything below it depends only on Atreides interfaces.
+
+A run with no tuning flags resolves to the V0.2.1 validated candidate — RF-DETR
+at 0.30, OC-SORT with a 0.30 high-confidence threshold, and Rule-B3
+deduplication on. The startup banner states which profile is in effect.
 
     uv run atreides-vision run --input data/input/test.mp4 --output artifacts/tracked.mp4
 """
@@ -14,13 +18,19 @@ import logging
 import sys
 from collections.abc import Sequence
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 
 from atreides_vision import __version__
 from atreides_vision.config import (
+    DEFAULT_DEDUPLICATE_DETECTIONS,
+    DEFAULT_DETECTION_CONFIDENCE,
+    DEFAULT_OCSORT_HIGH_CONF_THRESHOLD,
+    DEFAULT_TRACKER,
     DetectorConfig,
     Device,
     PipelineConfig,
+    Tracker,
     TrackerConfig,
     VisionConfig,
     VisualizationConfig,
@@ -29,7 +39,10 @@ from atreides_vision.config import (
 )
 from atreides_vision.detection.rfdetr import RFDetrPersonDetector
 from atreides_vision.errors import AtreidesVisionError, ConfigurationError
+from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.tracking.bytetrack import ByteTrackTracker
+from atreides_vision.tracking.diagnostics import JsonlTrackingDebugWriter
+from atreides_vision.tracking.ocsort import OcSortTracker
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
 from atreides_vision.video.source import FileVideoSource, VideoMetadata
@@ -40,7 +53,7 @@ from atreides_vision.zones.reporting import JsonlMetricsWriter
 
 logger = logging.getLogger("atreides_vision")
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "build_tracker", "main"]
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -83,9 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--confidence",
         type=float,
-        default=0.5,
+        default=DEFAULT_DETECTION_CONFIDENCE,
         metavar="FLOAT",
-        help="Minimum detection confidence, in (0, 1]. Default: 0.5.",
+        help=(
+            f"Minimum detection confidence, in (0, 1]. "
+            f"Default: {DEFAULT_DETECTION_CONFIDENCE:.2f} (V0.2.1 validated)."
+        ),
     )
     run_parser.add_argument(
         "--device",
@@ -95,6 +111,42 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Compute device: auto, cpu, mps (Apple Silicon) or cuda. "
             "auto prefers cuda, then mps, then cpu. Default: auto."
+        ),
+    )
+    run_parser.add_argument(
+        "--tracker",
+        type=Tracker,
+        choices=list(Tracker),
+        default=DEFAULT_TRACKER,
+        help=(
+            "Multi-object tracker: ocsort (default, V0.2.1 validated) or bytetrack. "
+            "OC-SORT scores association on direction consistency as well as IoU, "
+            "which holds ids through short occlusions and large scale changes. "
+            "ByteTrack remains fully supported."
+        ),
+    )
+    run_parser.add_argument(
+        "--ocsort-high-conf-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Override OC-SORT's high-confidence detection threshold for this run "
+            "only, in [0, 1]. Detections below it cannot start a new track. Omit "
+            f"to keep the default of {DEFAULT_OCSORT_HIGH_CONF_THRESHOLD:.2f}. "
+            "Ignored by ByteTrack."
+        ),
+    )
+    run_parser.add_argument(
+        "--deduplicate-detections",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_DEDUPLICATE_DETECTIONS,
+        help=(
+            "Suppress duplicate person detections before tracking using the fixed "
+            "conservative geometry rule B3 (IoU >= 0.85, area similarity >= 0.95, "
+            "centre distance <= 0.03). Single-frame box geometry only — no identity, "
+            "appearance or history. On by default since V0.2.1; pass "
+            "--no-deduplicate-detections to restore pre-V0.2.1 behaviour."
         ),
     )
     run_parser.add_argument(
@@ -122,6 +174,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write zone metrics as JSON Lines (e.g. artifacts/zone_metrics.jsonl). "
             "Requires --zones."
+        ),
+    )
+    run_parser.add_argument(
+        "--tracking-debug-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Diagnostics only. Write per-frame tracker internals as JSON Lines "
+            "(detections, reported tracks, and each internal tracklet's age, "
+            "time since update, last observation and predicted box). "
+            "Observational: it does not change tracking behaviour."
         ),
     )
     run_parser.add_argument(
@@ -160,6 +224,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_tracker(choice: Tracker, config: TrackerConfig) -> MultiObjectTracker:
+    """Construct the selected tracker adapter.
+
+    The one place a tracker implementation is chosen. Everything downstream sees
+    only the :class:`MultiObjectTracker` interface, which is what makes an A/B
+    swap a single argument rather than a code change.
+    """
+    if choice is Tracker.OCSORT:
+        return OcSortTracker(config)
+    return ByteTrackTracker(config)
+
+
+def _build_tracker_config(
+    frame_rate: float, ocsort_high_conf_threshold: float | None = None
+) -> TrackerConfig:
+    """Tracker settings for one run.
+
+    Everything comes from :class:`TrackerConfig`'s defaults except the frame
+    rate, which follows the source. ``ocsort_high_conf_threshold`` is an
+    experimental per-run override for OC-SORT's high-confidence gate; ``None``
+    leaves the default in place, so omitting the flag changes nothing.
+    """
+    config = TrackerConfig(frame_rate=frame_rate)
+    if ocsort_high_conf_threshold is None:
+        return config
+    return replace(config, high_conf_det_threshold=ocsort_high_conf_threshold)
+
+
 def _configure_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -183,6 +275,7 @@ def _run_command(args: argparse.Namespace) -> int:
         output_path=args.output,
         max_frames=args.max_frames,
         log_every_n_frames=args.log_every,
+        deduplicate_detections=args.deduplicate_detections,
     )
     device = resolve_device(args.device)
 
@@ -196,7 +289,7 @@ def _run_command(args: argparse.Namespace) -> int:
             pipeline=pipeline_config,
             detector=DetectorConfig(confidence_threshold=args.confidence, device=device),
             # The tracker's motion model is frame-rate sensitive, so it follows the source.
-            tracker=TrackerConfig(frame_rate=metadata.fps),
+            tracker=_build_tracker_config(metadata.fps, args.ocsort_high_conf_threshold),
             visualization=VisualizationConfig(
                 trail_length=args.trail_length,
                 draw_confidence=not args.no_confidence_labels,
@@ -207,7 +300,7 @@ def _run_command(args: argparse.Namespace) -> int:
         )
 
         detector = RFDetrPersonDetector(config.detector)
-        tracker = ByteTrackTracker(config.tracker)
+        tracker = build_tracker(args.tracker, config.tracker)
         analyzer = None if layout is None else ZoneAnalyzer(layout, config.zones)
 
         _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
@@ -230,6 +323,11 @@ def _run_command(args: argparse.Namespace) -> int:
                 if args.metrics_output is None
                 else stack.enter_context(JsonlMetricsWriter(args.metrics_output))
             )
+            tracking_debug_writer = (
+                None
+                if args.tracking_debug_output is None
+                else stack.enter_context(JsonlTrackingDebugWriter(args.tracking_debug_output))
+            )
 
             processor = VideoProcessor(
                 detector=detector,
@@ -237,6 +335,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 config=config,
                 zone_analyzer=analyzer,
                 metrics_writer=metrics_writer,
+                tracking_debug_writer=tracking_debug_writer,
             )
             result = processor.run(source, sink)
 
@@ -253,7 +352,19 @@ def _log_startup(
     zones_path: Path | None = None,
 ) -> None:
     frames = str(metadata.frame_count) if metadata.frame_count is not None else "unknown"
+    at_defaults = (
+        config.detector.confidence_threshold == DEFAULT_DETECTION_CONFIDENCE
+        and tracker_name == "OC-SORT"
+        and config.tracker.high_conf_det_threshold == DEFAULT_OCSORT_HIGH_CONF_THRESHOLD
+        and config.pipeline.deduplicate_detections is DEFAULT_DEDUPLICATE_DETECTIONS
+    )
     logger.info("Atreides Vision %s", __version__)
+    logger.info(
+        "Profile:     %s",
+        "V0.2.1 validated defaults"
+        if at_defaults
+        else "CUSTOM (one or more V0.2.1 defaults overridden)",
+    )
     logger.info("Input:       %s", config.pipeline.input_path)
     logger.info("Output:      %s", config.pipeline.output_path)
     logger.info("Resolution:  %s", metadata.resolution)
@@ -265,7 +376,15 @@ def _log_startup(
         config.detector.confidence_threshold,
     )
     logger.info("Tracker:     %s", tracker_name)
+    if tracker_name == "OC-SORT":
+        logger.info("  high-conf detection threshold: %.2f", config.tracker.high_conf_det_threshold)
     logger.info("Device:      %s", config.detector.device)
+    logger.info(
+        "Dedup:       %s",
+        "Rule B3 (IoU>=0.85, area>=0.95, centre<=0.03)"
+        if config.pipeline.deduplicate_detections
+        else "disabled",
+    )
     if layout is None:
         logger.info("Zones:       disabled (pass --zones to enable zone intelligence)")
     else:
@@ -289,6 +408,11 @@ def _log_completion(
     logger.info("Effective FPS:       %.2f", result.effective_fps)
     logger.info("Unique track IDs:    %d", result.unique_track_ids)
     logger.info("Output:              %s", result.output_path)
+    if result.detections_removed_by_deduplication:
+        logger.info(
+            "Deduplication:       %d detections suppressed before tracking",
+            result.detections_removed_by_deduplication,
+        )
     if analyzer is not None:
         analyzer.log_summary()
     if metrics_path is not None:

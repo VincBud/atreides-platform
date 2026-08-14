@@ -24,8 +24,14 @@ from pathlib import Path
 
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
+from atreides_vision.detection.deduplication import deduplicate_with_report
 from atreides_vision.models import Track
 from atreides_vision.tracking.base import MultiObjectTracker
+from atreides_vision.tracking.diagnostics import (
+    TrackingDebugRecord,
+    TrackingDebugWriter,
+    snapshot_internal_tracks,
+)
 from atreides_vision.video.sink import VideoSink
 from atreides_vision.video.source import VideoSource
 from atreides_vision.video.trajectories import TrajectoryStore
@@ -79,6 +85,8 @@ class ProcessingResult:
     final_zone_report: ZoneReport | None = None
     #: Records written to the metrics stream, if one was attached.
     metrics_records_written: int = 0
+    #: Detections suppressed by deduplication. Always 0 when it is disabled.
+    detections_removed_by_deduplication: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -104,6 +112,7 @@ class VideoProcessor:
         clock: Callable[[], float] = time.perf_counter,
         zone_analyzer: ZoneAnalyzer | None = None,
         metrics_writer: MetricsWriter | None = None,
+        tracking_debug_writer: TrackingDebugWriter | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -112,6 +121,7 @@ class VideoProcessor:
         self._clock = clock
         self._zone_analyzer = zone_analyzer
         self._metrics_writer = metrics_writer
+        self._tracking_debug_writer = tracking_debug_writer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -142,6 +152,9 @@ class VideoProcessor:
         metrics_records = 0
         zone_report: ZoneReport | None = None
 
+        deduplicate = self._config.pipeline.deduplicate_detections
+        detections_removed = 0
+
         frames_processed = 0
         started_at = self._clock()
 
@@ -152,8 +165,35 @@ class VideoProcessor:
 
             timestamp_seconds = (frame_index - 1) / source_fps
 
-            detections = self._detector.detect(frame)
+            raw_detections = self._detector.detect(frame)
+
+            # Optional, off by default: geometric duplicate suppression sits
+            # between detection and tracking, so the tracker never sees two
+            # boxes on one person. Anonymous single-frame geometry only.
+            if deduplicate:
+                report = deduplicate_with_report(raw_detections)
+                detections = list(report.kept)
+                removed_detections = report.removed
+                detections_removed += report.removed_count
+            else:
+                detections = raw_detections
+                removed_detections = ()
+
             tracks = self._tracker.update(detections, frame)
+
+            if self._tracking_debug_writer is not None:
+                # Purely observational: reads state the tracker has already
+                # computed. Enabled only by --tracking-debug-output.
+                self._tracking_debug_writer.write(
+                    TrackingDebugRecord(
+                        frame_index=frame_index,
+                        detections=tuple(detections),
+                        reported_tracks=tuple(tracks),
+                        internal_tracks=snapshot_internal_tracks(self._tracker),
+                        raw_detections=tuple(raw_detections) if deduplicate else None,
+                        removed_detections=removed_detections,
+                    )
+                )
 
             trajectories.update(tracks, frame_index)
             seen_track_ids.update(track.track_id for track in tracks)
@@ -199,6 +239,7 @@ class VideoProcessor:
             unique_track_ids=len(seen_track_ids),
             final_zone_report=zone_report,
             metrics_records_written=metrics_records,
+            detections_removed_by_deduplication=detections_removed,
         )
 
     def _log_progress(

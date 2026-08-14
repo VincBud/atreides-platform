@@ -18,11 +18,16 @@ from atreides_vision.zones.config import ZoneAnalysisConfig
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_DEDUPLICATE_DETECTIONS",
+    "DEFAULT_DETECTION_CONFIDENCE",
+    "DEFAULT_OCSORT_HIGH_CONF_THRESHOLD",
+    "DEFAULT_TRACKER",
     "AcceleratorProbe",
     "DetectorConfig",
     "Device",
     "PipelineConfig",
     "TorchAcceleratorProbe",
+    "Tracker",
     "TrackerConfig",
     "VisionConfig",
     "VisualizationConfig",
@@ -33,6 +38,23 @@ __all__ = [
 #: COCO category id for "person" in the RF-DETR pretrained checkpoints.
 #: Pretrained RF-DETR emits raw COCO category ids (1-90, sparse), not 0-based indices.
 COCO_PERSON_CLASS_ID = 1
+
+# The V0.2.1 validated candidate, named once. The dataclass defaults below and
+# the CLI both read these, so `--help` can never drift from actual behaviour.
+# `slots=True` hides dataclass defaults from class-attribute access, which is
+# why these are module constants rather than something the CLI introspects.
+#
+# Validated on three fixed cameras: elevated dense daylight (1080p/30), night
+# under strong artificial light (1080p/30), and a head-on corridor (384x288/25).
+# See docs/vision/V0.2.1_FIXED_CCTV_VALIDATION.md. Development defaults, not a
+# claim of production-wide optimality.
+
+#: Detector confidence floor. See :class:`DetectorConfig`.
+DEFAULT_DETECTION_CONFIDENCE: float = 0.30
+#: Confidence above which OC-SORT may start a new track. See :class:`TrackerConfig`.
+DEFAULT_OCSORT_HIGH_CONF_THRESHOLD: float = 0.30
+#: Whether geometric detection deduplication runs. See :class:`PipelineConfig`.
+DEFAULT_DEDUPLICATE_DETECTIONS: bool = True
 
 
 class Device(StrEnum):
@@ -136,7 +158,12 @@ def resolve_device(requested: Device, probe: AcceleratorProbe | None = None) -> 
 class DetectorConfig:
     """Detector-agnostic settings. The RF-DETR adapter reads these."""
 
-    confidence_threshold: float = 0.5
+    #: V0.2.1 validated default. Lowered from 0.50 after a three-scene fixed-CCTV
+    #: validation: 0.50 dropped a large share of mid- and far-field people, and
+    #: 0.30 recovered them without introducing false positives that survived
+    #: manual inspection. The extra weak detections it admits are duplicate-prone,
+    #: which is what :data:`~atreides_vision.detection.deduplication.RULE_B3` is for.
+    confidence_threshold: float = DEFAULT_DETECTION_CONFIDENCE
     device: str = "cpu"
     person_class_id: int = COCO_PERSON_CLASS_ID
     #: Optional inference resolution override; ``None`` keeps the model default.
@@ -153,20 +180,64 @@ class DetectorConfig:
             raise ConfigurationError(f"resolution must be positive, got {self.resolution}")
 
 
+class Tracker(StrEnum):
+    """Multi-object tracker implementation to run.
+
+    OC-SORT is the V0.2.1 default: it scores association on direction
+    consistency as well as IoU, which held ids through short occlusions and
+    through 3-4x box scale change where the ByteTrack baseline fragmented.
+    ByteTrack remains fully supported and selectable for comparison.
+    """
+
+    BYTETRACK = "bytetrack"
+    OCSORT = "ocsort"
+
+
+#: The tracker a standard run uses. See :class:`Tracker`.
+DEFAULT_TRACKER: Tracker = Tracker.OCSORT
+
+
 @dataclass(frozen=True, slots=True)
 class TrackerConfig:
-    """Tracker-agnostic settings. The ByteTrack adapter reads these."""
+    """Settings shared by the tracker adapters.
+
+    The first block applies to every tracker. The second is read only by
+    OC-SORT, which has no equivalent of ``track_activation_threshold``.
+    """
 
     #: Source frame rate, used by the tracker's motion model.
     frame_rate: float = 30.0
     #: How many frames a lost track is kept alive before being discarded.
     lost_track_buffer: int = 30
-    #: Detections above this confidence can start a new track.
+    #: Detections above this confidence can start a new track. ByteTrack only.
     track_activation_threshold: float = 0.5
     #: Frames a new track must persist before it is reported.
     minimum_consecutive_frames: int = 2
     #: Minimum IoU for a detection to be associated with an existing track.
+    #: ByteTrack only — OC-SORT reads ``ocsort_minimum_iou_threshold`` so the two
+    #: can be tuned independently without disturbing each other's baseline.
     minimum_iou_threshold: float = 0.3
+
+    #: OC-SORT only. Minimum IoU for association. Kept separate from the
+    #: ByteTrack field of the same meaning so the two can be tuned
+    #: independently without contaminating each other's baseline.
+    #: A 0.2 experiment reduced total ids but did not fix the occlusion case
+    #: under investigation, so this is back at the production candidate value.
+    ocsort_minimum_iou_threshold: float = 0.3
+    #: OC-SORT only. How much direction consistency counts alongside IoU when
+    #: associating a detection with a track. This is what lets OC-SORT re-attach
+    #: a person who was briefly occluded rather than opening a new id.
+    direction_consistency_weight: float = 0.2
+    #: OC-SORT only. Confidence above which a detection may start a new track.
+    #: Kept at or below the detector's own threshold so no detection that
+    #: reaches the tracker is silently ineligible to become a track. V0.2.1
+    #: moved this to 0.30 alongside the detector: left at 0.50 it would have
+    #: discarded the very mid- and far-field people the lower detector
+    #: threshold was adopted to recover.
+    high_conf_det_threshold: float = DEFAULT_OCSORT_HIGH_CONF_THRESHOLD
+    #: OC-SORT only. How many frames back the "last known observation" used for
+    #: velocity direction is taken from.
+    delta_t: int = 3
 
     def __post_init__(self) -> None:
         if self.frame_rate <= 0:
@@ -184,6 +255,22 @@ class TrackerConfig:
             raise ConfigurationError(
                 f"minimum_consecutive_frames must be >= 1, got {self.minimum_consecutive_frames}"
             )
+        if not 0.0 <= self.ocsort_minimum_iou_threshold <= 1.0:
+            raise ConfigurationError(
+                "ocsort_minimum_iou_threshold must be in [0, 1], "
+                f"got {self.ocsort_minimum_iou_threshold}"
+            )
+        if not 0.0 <= self.direction_consistency_weight <= 1.0:
+            raise ConfigurationError(
+                "direction_consistency_weight must be in [0, 1], "
+                f"got {self.direction_consistency_weight}"
+            )
+        if not 0.0 <= self.high_conf_det_threshold <= 1.0:
+            raise ConfigurationError(
+                f"high_conf_det_threshold must be in [0, 1], got {self.high_conf_det_threshold}"
+            )
+        if self.delta_t < 1:
+            raise ConfigurationError(f"delta_t must be >= 1, got {self.delta_t}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +318,14 @@ class PipelineConfig:
     max_frames: int | None = None
     #: Emit a progress log line every N processed frames.
     log_every_n_frames: int = 100
+    #: V0.2.1 validated default: on. Suppress duplicate person detections
+    #: geometrically before tracking, using the fixed conservative
+    #: :data:`~atreides_vision.detection.deduplication.RULE_B3` policy. Across
+    #: three validation scenes it removed 0.08-0.13% of detections, every
+    #: manually inspected removal was two boxes on one person, and no case was
+    #: found where it merged two genuine people. Disable with
+    #: ``--no-deduplicate-detections`` to reproduce pre-V0.2.1 behaviour.
+    deduplicate_detections: bool = DEFAULT_DEDUPLICATE_DETECTIONS
 
     def __post_init__(self) -> None:
         if self.max_frames is not None and self.max_frames < 1:

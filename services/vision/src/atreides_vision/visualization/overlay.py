@@ -15,6 +15,12 @@ import numpy as np
 from atreides_vision.config import VisualizationConfig
 from atreides_vision.models import Point, Track
 from atreides_vision.video.trajectories import TrajectoryStore
+from atreides_vision.visualization.layout import (
+    OverlayScale,
+    PanelLayout,
+    panel_layout,
+    resolve_overlay_scale,
+)
 from atreides_vision.zones.models import Zone, ZoneReport, ZoneSnapshot
 
 __all__ = [
@@ -109,13 +115,35 @@ class StatusOverlay:
     track_count: int
     zone_count: int | None = None
 
-    def lines(self) -> tuple[str, ...]:
+    def lines(self, compact: bool = False) -> tuple[str, ...]:
+        """The panel's text.
+
+        ``compact`` abbreviates the labels for small frames. The title carries
+        the most width for the least information, so it is what gets cut first;
+        the live numbers are the point of the panel and are always kept.
+        """
+        title = "ATREIDES" if compact else "ATREIDES // SEE + TRACK"
         if self.zone_count is None:
+            if compact:
+                return (
+                    title,
+                    f"F {self.frame_index}",
+                    f"{self.processing_fps:.1f} FPS",
+                    f"Trk {self.track_count}",
+                )
             return (
-                "ATREIDES // SEE + TRACK",
+                title,
                 f"Frame: {self.frame_index}",
                 f"Processing: {self.processing_fps:.1f} FPS",
                 f"Tracks: {self.track_count}",
+            )
+        if compact:
+            return (
+                "ATREIDES",
+                f"F {self.frame_index}",
+                f"{self.processing_fps:.1f} FPS",
+                f"Trk {self.track_count}",
+                f"Zn {self.zone_count}",
             )
         return (
             "ATREIDES // ZONE INTELLIGENCE",
@@ -141,6 +169,22 @@ class Annotator:
     def config(self) -> VisualizationConfig:
         return self._config
 
+    def scale_for(self, frame: np.ndarray) -> OverlayScale:
+        """Overlay sizes for this frame's dimensions.
+
+        Every draw method resolves this itself when not given one, so each stays
+        usable standalone; :meth:`annotate` resolves it once and passes it down.
+        """
+        height, width = frame.shape[:2]
+        return resolve_overlay_scale(
+            width,
+            height,
+            base_font_scale=self._config.font_scale,
+            base_box_thickness=self._config.box_thickness,
+            base_trail_thickness=self._config.trail_thickness,
+            base_outline_thickness=self._config.zone_outline_thickness,
+        )
+
     def annotate(
         self,
         frame: np.ndarray,
@@ -154,18 +198,19 @@ class Annotator:
         Order matters: zones are venue structure and belong behind the people
         standing in them.
         """
+        scale = self.scale_for(frame)
         if zones is not None and self._config.draw_zones:
             # The status panel is drawn last and would otherwise cover the label
             # of any zone anchored in the top-left corner, hiding its metrics.
-            reserved = None if status is None else self._status_panel_size(frame, status)
-            self.draw_zones(frame, zones, reserved)
+            reserved = None if status is None else self._status_panel_size(frame, status, scale)
+            self.draw_zones(frame, zones, reserved, scale)
         for track in tracks:
             color = color_for_track_id(track.track_id)
             if trajectories is not None:
-                self.draw_trail(frame, trajectories.trail(track.track_id), color)
-            self.draw_track(frame, track, color)
+                self.draw_trail(frame, trajectories.trail(track.track_id), color, scale)
+            self.draw_track(frame, track, color, scale)
         if status is not None:
-            self.draw_status(frame, status)
+            self.draw_status(frame, status, scale)
         return frame
 
     def draw_zones(
@@ -173,6 +218,7 @@ class Annotator:
         frame: np.ndarray,
         zones: ZoneOverlay,
         reserved: tuple[int, int] | None = None,
+        scale: OverlayScale | None = None,
     ) -> None:
         """Draw every configured zone boundary and its metrics panel.
 
@@ -181,7 +227,9 @@ class Annotator:
             zones: Zones and their current metrics.
             reserved: ``(width, height)`` of the top-left region occupied by the
                 status panel, which zone labels must not hide behind.
+            scale: Overlay sizes for this frame; resolved from the frame if omitted.
         """
+        scale = scale or self.scale_for(frame)
         for index, zone in enumerate(zones.zones):
             # Colour by position so configured zones are always distinguishable.
             self.draw_zone(
@@ -190,6 +238,7 @@ class Annotator:
                 zones.snapshots.get(zone.id),
                 color=color_for_zone_index(index),
                 reserved=reserved,
+                scale=scale,
             )
 
     def draw_zone(
@@ -199,8 +248,10 @@ class Annotator:
         snapshot: ZoneSnapshot | None = None,
         color: tuple[int, int, int] | None = None,
         reserved: tuple[int, int] | None = None,
+        scale: OverlayScale | None = None,
     ) -> None:
         """Draw one zone polygon, its name, and its current metrics."""
+        scale = scale or self.scale_for(frame)
         height, width = frame.shape[:2]
         polygon = zone.polygon.to_pixel_array(width, height)
         color = color or color_for_zone_id(zone.id)
@@ -213,12 +264,12 @@ class Annotator:
             [polygon],
             isClosed=True,
             color=color,
-            thickness=self._config.zone_outline_thickness,
+            thickness=scale.outline_thickness,
             lineType=cv2.LINE_AA,
         )
 
         anchor = zone.polygon.top_left.to_pixels(width, height).as_int_tuple()
-        self._draw_zone_panel(frame, zone, snapshot, anchor, color, reserved)
+        self._draw_zone_panel(frame, zone, snapshot, anchor, color, reserved, scale)
 
     def _fill_polygon(
         self,
@@ -251,23 +302,27 @@ class Annotator:
         anchor: tuple[int, int],
         color: tuple[int, int, int],
         reserved: tuple[int, int] | None = None,
+        scale: OverlayScale | None = None,
     ) -> None:
         """Draw the zone's name and metrics just inside its top-left corner."""
+        scale = scale or self.scale_for(frame)
         lines = [zone.name.upper()]
         if snapshot is not None:
-            lines.append(f"People: {snapshot.occupancy}")
-            lines.append(f"Motion: {snapshot.motion_level:.2f}")
-            lines.append(f"Avg dwell: {snapshot.average_dwell_seconds:.1f}s")
-            if self._config.draw_zone_counters:
-                lines.append(f"In {snapshot.entries} / Out {snapshot.exits}")
+            if scale.compact:
+                lines.append(f"P {snapshot.occupancy}")
+                lines.append(f"M {snapshot.motion_level:.2f}")
+                lines.append(f"D {snapshot.average_dwell_seconds:.1f}s")
+                if self._config.draw_zone_counters:
+                    lines.append(f"{snapshot.entries}/{snapshot.exits}")
+            else:
+                lines.append(f"People: {snapshot.occupancy}")
+                lines.append(f"Motion: {snapshot.motion_level:.2f}")
+                lines.append(f"Avg dwell: {snapshot.average_dwell_seconds:.1f}s")
+                if self._config.draw_zone_counters:
+                    lines.append(f"In {snapshot.entries} / Out {snapshot.exits}")
 
-        scale = self._config.font_scale
-        line_height = int(20 * max(scale / 0.5, 1.0))
-        padding = 6
-
-        text_width = max(cv2.getTextSize(line, _FONT, scale, 1)[0][0] for line in lines)
-        panel_width = min(text_width + padding * 2, frame.shape[1])
-        panel_height = min(line_height * len(lines) + padding, frame.shape[0])
+        layout = panel_layout(frame.shape[1], frame.shape[0], lines, scale)
+        panel_width, panel_height = layout.width, layout.height
 
         left = max(0, min(anchor[0], frame.shape[1] - panel_width))
         top = max(0, min(anchor[1], frame.shape[0] - panel_height))
@@ -285,103 +340,108 @@ class Annotator:
         backing = np.full(region.shape, _PANEL_BG, dtype=np.uint8)
         cv2.addWeighted(backing, 0.6, region, 0.4, 0.0, dst=region)
 
-        y = top + padding + int(line_height * 0.62)
         for index, line in enumerate(lines):
             cv2.putText(
                 frame,
                 line,
-                (left + padding, y),
+                (left + layout.padding, top + layout.baseline(index)),
                 _FONT,
-                scale,
+                layout.font_scale,
                 # The zone name takes the zone's colour; metrics stay neutral.
                 color if index == 0 else _WHITE,
                 1,
                 lineType=cv2.LINE_AA,
             )
-            y += line_height
 
     def draw_track(
-        self, frame: np.ndarray, track: Track, color: tuple[int, int, int] | None = None
+        self,
+        frame: np.ndarray,
+        track: Track,
+        color: tuple[int, int, int] | None = None,
+        scale: OverlayScale | None = None,
     ) -> None:
         """Draw one bounding box and its ``ID <n>`` label."""
+        scale = scale or self.scale_for(frame)
         color = color or color_for_track_id(track.track_id)
         height, width = frame.shape[:2]
         x1, y1, x2, y2 = track.bbox_xyxy.clipped_to(width, height).as_int_tuple()
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, self._config.box_thickness)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, scale.box_thickness)
 
         label = f"ID {track.track_id}"
         if self._config.draw_confidence and track.confidence is not None:
             label = f"{label}  {track.confidence:.2f}"
-        self._draw_label(frame, label, anchor=(x1, y1), color=color)
+        self._draw_label(frame, label, anchor=(x1, y1), color=color, scale=scale)
 
     def draw_trail(
         self,
         frame: np.ndarray,
         points: Sequence[Point],
         color: tuple[int, int, int],
+        scale: OverlayScale | None = None,
     ) -> None:
         """Draw the recent path of a track as a polyline."""
         if len(points) < 2:
             return
+        scale = scale or self.scale_for(frame)
         polyline = np.array([point.as_int_tuple() for point in points], dtype=np.int32)
         cv2.polylines(
             frame,
             [polyline],
             isClosed=False,
             color=color,
-            thickness=self._config.trail_thickness,
+            thickness=scale.trail_thickness,
             lineType=cv2.LINE_AA,
         )
 
-    def _status_panel_size(self, frame: np.ndarray, status: StatusOverlay) -> tuple[int, int]:
+    def _status_layout(
+        self, frame: np.ndarray, status: StatusOverlay, scale: OverlayScale
+    ) -> PanelLayout:
+        return panel_layout(frame.shape[1], frame.shape[0], status.lines(scale.compact), scale)
+
+    def _status_panel_size(
+        self, frame: np.ndarray, status: StatusOverlay, scale: OverlayScale | None = None
+    ) -> tuple[int, int]:
         """The ``(width, height)`` the status panel will occupy, in pixels."""
-        scale = self._config.font_scale
-        line_height = int(22 * max(scale / 0.5, 1.0))
-        padding = 8
-        lines = status.lines()
+        scale = scale or self.scale_for(frame)
+        layout = self._status_layout(frame, status, scale)
+        return layout.width, layout.height
 
-        text_widths = [cv2.getTextSize(line, _FONT, scale, 1)[0][0] for line in lines]
-        return (
-            min(max(text_widths) + padding * 2, frame.shape[1]),
-            min(line_height * len(lines) + padding, frame.shape[0]),
-        )
-
-    def draw_status(self, frame: np.ndarray, status: StatusOverlay) -> None:
+    def draw_status(
+        self, frame: np.ndarray, status: StatusOverlay, scale: OverlayScale | None = None
+    ) -> None:
         """Draw the top-left processing panel."""
-        lines = status.lines()
-        scale = self._config.font_scale
-        line_height = int(22 * max(scale / 0.5, 1.0))
-        padding = 8
-
-        panel_width, panel_height = self._status_panel_size(frame, status)
+        scale = scale or self.scale_for(frame)
+        lines = status.lines(scale.compact)
+        layout = self._status_layout(frame, status, scale)
+        panel_width, panel_height = layout.width, layout.height
 
         # Translucent backing so text stays readable over bright footage.
         region = frame[0:panel_height, 0:panel_width]
         backing = np.full(region.shape, _PANEL_BG, dtype=np.uint8)
         cv2.addWeighted(backing, 0.55, region, 0.45, 0.0, dst=region)
 
-        y = padding + int(line_height * 0.65)
+        rule_offset = max(1, round(5 * scale.factor))
         for index, line in enumerate(lines):
+            y = layout.baseline(index)
             cv2.putText(
                 frame,
                 line,
-                (padding, y),
+                (layout.padding, y),
                 _FONT,
-                scale,
+                layout.font_scale,
                 _WHITE,
                 1,
                 lineType=cv2.LINE_AA,
             )
-            if index == 0:
+            if index == 0 and y + rule_offset < panel_height:
                 # Rule under the title, to separate branding from live numbers.
                 cv2.line(
                     frame,
-                    (padding, y + 5),
-                    (panel_width - padding, y + 5),
+                    (layout.padding, y + rule_offset),
+                    (panel_width - layout.padding, y + rule_offset),
                     (110, 110, 110),
                     1,
                 )
-            y += line_height
 
     def _draw_label(
         self,
@@ -389,30 +449,34 @@ class Annotator:
         text: str,
         anchor: tuple[int, int],
         color: tuple[int, int, int],
+        scale: OverlayScale | None = None,
     ) -> None:
-        scale = self._config.font_scale
-        (text_width, text_height), baseline = cv2.getTextSize(text, _FONT, scale, 1)
+        scale = scale or self.scale_for(frame)
+        font_scale = scale.font_scale
+        pad = scale.label_padding
+        (text_width, text_height), baseline = cv2.getTextSize(text, _FONT, font_scale, 1)
         x, y = anchor
-        box_height = text_height + baseline + 4
+        box_height = text_height + baseline + pad * 2
+        box_width = text_width + pad * 2
 
         # Flip the label inside the box when the track is at the top edge.
         top = y - box_height if y - box_height >= 0 else y
         top = max(0, min(top, frame.shape[0] - box_height))
-        left = max(0, min(x, frame.shape[1] - text_width - 6))
+        left = max(0, min(x, frame.shape[1] - box_width))
 
         cv2.rectangle(
             frame,
             (left, top),
-            (left + text_width + 6, top + box_height),
+            (left + box_width, top + box_height),
             color,
             thickness=-1,
         )
         cv2.putText(
             frame,
             text,
-            (left + 3, top + text_height + 2),
+            (left + pad, top + text_height + pad),
             _FONT,
-            scale,
+            font_scale,
             (20, 20, 20),
             1,
             lineType=cv2.LINE_AA,

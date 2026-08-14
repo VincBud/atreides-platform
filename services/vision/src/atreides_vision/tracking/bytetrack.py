@@ -1,9 +1,11 @@
-"""ByteTrack adapter — the initial :class:`MultiObjectTracker` implementation.
+"""ByteTrack adapter — the default :class:`MultiObjectTracker` implementation.
 
-This module is the **only** place in Atreides allowed to import ``trackers`` or
-``supervision``. It owns both directions of the conversion:
+``trackers`` is imported here and nowhere outside
+:mod:`atreides_vision.tracking`. The conversion in both directions
 
 ``list[Detection]`` -> ``sv.Detections`` -> ByteTrack -> ``sv.Detections`` -> ``list[Track]``
+
+is shared with the other adapters via :mod:`atreides_vision.tracking.conversion`.
 """
 
 from __future__ import annotations
@@ -16,14 +18,16 @@ import numpy as np
 
 from atreides_vision.config import TrackerConfig
 from atreides_vision.errors import TrackerError
-from atreides_vision.models import BoundingBox, Detection, Track, detections_to_arrays
+from atreides_vision.models import Detection, Track
+from atreides_vision.tracking.conversion import (
+    UNASSIGNED_TRACKER_ID,
+    detections_to_supervision,
+    supervision_to_tracks,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ByteTrackBackend", "ByteTrackTracker"]
-
-#: ByteTrack marks detections it did not assign to a confirmed track with -1.
-UNASSIGNED_TRACKER_ID = -1
+__all__ = ["UNASSIGNED_TRACKER_ID", "ByteTrackBackend", "ByteTrackTracker"]
 
 
 class ByteTrackBackend(Protocol):
@@ -85,6 +89,15 @@ class ByteTrackTracker:
     def config(self) -> TrackerConfig:
         return self._config
 
+    @property
+    def backend(self) -> ByteTrackBackend:
+        """The underlying tracker, for read-only diagnostics.
+
+        Exposed so :mod:`atreides_vision.tracking.diagnostics` can copy out
+        internal tracklet state. Nothing in the pipeline writes through it.
+        """
+        return self._backend
+
     def update(self, detections: list[Detection], frame: np.ndarray) -> list[Track]:
         """Advance ByteTrack by one frame. See :class:`MultiObjectTracker`.
 
@@ -94,61 +107,13 @@ class ByteTrackTracker:
         """
         del frame  # ByteTrack is motion-only; passing a frame would only warn.
 
-        sv_detections = self._to_supervision(detections)
+        sv_detections = detections_to_supervision(detections)
         try:
             tracked = self._backend.update(sv_detections)
         except Exception as exc:
             raise TrackerError(f"ByteTrack update failed: {exc}") from exc
-        return self._to_tracks(tracked)
+        return supervision_to_tracks(tracked)
 
     def reset(self) -> None:
         """Drop all ByteTrack state."""
         self._backend.reset()
-
-    @staticmethod
-    def _to_supervision(detections: list[Detection]) -> Any:
-        """Convert Atreides detections into ``sv.Detections``."""
-        import supervision as sv
-
-        if not detections:
-            return sv.Detections.empty()
-        xyxy, confidence, class_id = detections_to_arrays(detections)
-        return sv.Detections(xyxy=xyxy, confidence=confidence, class_id=class_id)
-
-    @staticmethod
-    def _to_tracks(tracked: Any) -> list[Track]:
-        """Convert ByteTrack's ``sv.Detections`` output into Atreides tracks.
-
-        Detections ByteTrack could not confirm carry ``tracker_id == -1`` and are
-        dropped: the pipeline only ever sees confirmed tracks.
-        """
-        tracker_ids = getattr(tracked, "tracker_id", None)
-        if tracker_ids is None:
-            return []
-        tracker_ids = np.asarray(tracker_ids).reshape(-1)
-        if tracker_ids.size == 0:
-            return []
-
-        xyxy = np.asarray(tracked.xyxy, dtype=np.float64).reshape(-1, 4)
-        raw_confidence = getattr(tracked, "confidence", None)
-        confidence: np.ndarray | None = None
-        if raw_confidence is not None:
-            confidence = np.asarray(raw_confidence, dtype=np.float64).reshape(-1)
-
-        tracks: list[Track] = []
-        for index in range(tracker_ids.size):
-            track_id = int(tracker_ids[index])
-            if track_id == UNASSIGNED_TRACKER_ID:
-                continue
-            try:
-                box = BoundingBox.from_xyxy(xyxy[index])
-            except ValueError:
-                logger.debug("Skipping malformed tracked box %s", xyxy[index])
-                continue
-            score: float | None = None
-            if confidence is not None and index < confidence.size:
-                value = float(confidence[index])
-                if np.isfinite(value):
-                    score = min(max(value, 0.0), 1.0)
-            tracks.append(Track(track_id=track_id, bbox_xyxy=box, confidence=score))
-        return tracks

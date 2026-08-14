@@ -8,9 +8,14 @@ from pathlib import Path
 import pytest
 
 from atreides_vision.config import (
+    DEFAULT_DEDUPLICATE_DETECTIONS,
+    DEFAULT_DETECTION_CONFIDENCE,
+    DEFAULT_OCSORT_HIGH_CONF_THRESHOLD,
+    DEFAULT_TRACKER,
     DetectorConfig,
     Device,
     PipelineConfig,
+    Tracker,
     TrackerConfig,
     VisionConfig,
     VisualizationConfig,
@@ -109,6 +114,65 @@ class TestTrackerConfig:
         with pytest.raises(ConfigurationError, match="minimum_consecutive_frames"):
             TrackerConfig(minimum_consecutive_frames=0)
 
+    def test_ocsort_v021_validated_defaults(self) -> None:
+        """The frozen V0.2.1 candidate, asserted field by field."""
+        config = TrackerConfig()
+        assert config.ocsort_minimum_iou_threshold == 0.3
+        assert config.direction_consistency_weight == 0.2
+        assert config.high_conf_det_threshold == 0.30
+        assert config.high_conf_det_threshold == DEFAULT_OCSORT_HIGH_CONF_THRESHOLD
+        assert config.delta_t == 3
+        assert config.lost_track_buffer == 30
+        assert config.minimum_consecutive_frames == 2
+
+    def test_ocsort_iou_is_a_separate_field_from_bytetrack(self) -> None:
+        """They share a value today; they must not share a knob.
+
+        Tuning one must never move the other, or an A/B is contaminated.
+        """
+        assert TrackerConfig().minimum_iou_threshold == 0.3
+        assert TrackerConfig().ocsort_minimum_iou_threshold == 0.3
+
+        tuned = TrackerConfig(ocsort_minimum_iou_threshold=0.2)
+        assert tuned.ocsort_minimum_iou_threshold == 0.2
+        assert tuned.minimum_iou_threshold == 0.3, "ByteTrack must be unaffected"
+
+    def test_ocsort_activation_stays_at_or_below_the_detector_threshold(self) -> None:
+        """A higher tracker threshold would silently discard passing detections."""
+        assert TrackerConfig().high_conf_det_threshold <= DetectorConfig().confidence_threshold
+
+    @pytest.mark.parametrize("threshold", [-0.01, 1.01])
+    def test_rejects_bad_ocsort_iou_threshold(self, threshold: float) -> None:
+        with pytest.raises(ConfigurationError, match="ocsort_minimum_iou_threshold"):
+            TrackerConfig(ocsort_minimum_iou_threshold=threshold)
+
+    @pytest.mark.parametrize("weight", [-0.1, 1.5])
+    def test_rejects_bad_direction_consistency_weight(self, weight: float) -> None:
+        with pytest.raises(ConfigurationError, match="direction_consistency_weight"):
+            TrackerConfig(direction_consistency_weight=weight)
+
+    @pytest.mark.parametrize("threshold", [-0.01, 1.01])
+    def test_rejects_bad_high_conf_det_threshold(self, threshold: float) -> None:
+        with pytest.raises(ConfigurationError, match="high_conf_det_threshold"):
+            TrackerConfig(high_conf_det_threshold=threshold)
+
+    def test_rejects_zero_delta_t(self) -> None:
+        with pytest.raises(ConfigurationError, match="delta_t"):
+            TrackerConfig(delta_t=0)
+
+
+class TestTrackerChoice:
+    def test_values_match_the_cli_spelling(self) -> None:
+        assert Tracker.BYTETRACK.value == "bytetrack"
+        assert Tracker.OCSORT.value == "ocsort"
+
+    def test_parsed_from_a_string(self) -> None:
+        assert Tracker("ocsort") is Tracker.OCSORT
+
+    def test_unknown_tracker_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="deepsort"):
+            Tracker("deepsort")
+
 
 class TestVisualizationConfig:
     def test_rejects_short_trail(self) -> None:
@@ -140,6 +204,58 @@ class TestPipelineConfig:
 class TestVisionConfig:
     def test_sub_configs_default(self) -> None:
         config = VisionConfig(pipeline=PipelineConfig(Path("in.mp4"), Path("out.mp4")))
-        assert config.detector.confidence_threshold == 0.5
+        assert config.detector.confidence_threshold == DEFAULT_DETECTION_CONFIDENCE
         assert config.tracker.frame_rate == 30.0
         assert config.visualization.trail_length == 25
+
+
+class TestV021ValidatedDefaults:
+    """A standard run must resolve to the V0.2.1 validated candidate.
+
+    These constants were fixed by a three-scene fixed-CCTV validation. Changing
+    one is a deliberate act that should fail here first, not a silent drift.
+    """
+
+    def test_detector_confidence(self) -> None:
+        assert DEFAULT_DETECTION_CONFIDENCE == 0.30
+        assert DetectorConfig().confidence_threshold == 0.30
+
+    def test_tracker_is_ocsort(self) -> None:
+        assert DEFAULT_TRACKER is Tracker.OCSORT
+
+    def test_ocsort_high_conf_threshold(self) -> None:
+        assert DEFAULT_OCSORT_HIGH_CONF_THRESHOLD == 0.30
+        assert TrackerConfig().high_conf_det_threshold == 0.30
+
+    def test_deduplication_is_on(self) -> None:
+        assert DEFAULT_DEDUPLICATE_DETECTIONS is True
+        assert PipelineConfig(Path("in.mp4"), Path("out.mp4")).deduplicate_detections is True
+
+    def test_untouched_ocsort_parameters_kept_their_values(self) -> None:
+        """V0.2.1 promoted defaults; it did not retune the tracker."""
+        config = TrackerConfig()
+        assert config.ocsort_minimum_iou_threshold == 0.30
+        assert config.lost_track_buffer == 30
+        assert config.minimum_consecutive_frames == 2
+        assert config.direction_consistency_weight == 0.2
+        assert config.delta_t == 3
+
+    def test_whole_candidate_resolves_from_a_bare_config(self) -> None:
+        config = VisionConfig(pipeline=PipelineConfig(Path("in.mp4"), Path("out.mp4")))
+        assert config.detector.confidence_threshold == 0.30
+        assert config.tracker.high_conf_det_threshold == 0.30
+        assert config.pipeline.deduplicate_detections is True
+
+    def test_bytetrack_remains_available(self) -> None:
+        """Promoting OC-SORT must not remove the alternative."""
+        assert Tracker.BYTETRACK in set(Tracker)
+        assert Tracker("bytetrack") is Tracker.BYTETRACK
+
+    def test_dedup_policy_is_rule_b3(self) -> None:
+        from atreides_vision.detection.deduplication import RULE_B3
+
+        assert (RULE_B3.min_iou, RULE_B3.min_area_similarity, RULE_B3.max_center_distance) == (
+            0.85,
+            0.95,
+            0.03,
+        )
