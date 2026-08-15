@@ -117,7 +117,7 @@ class TestFlags:
         )
         assert code == EXIT_ERROR
         # It got past the flag check and failed on the missing video instead.
-        assert "--behavior-output or --interaction-output" not in caplog.text
+        assert "--behavior-output, --interaction-output or --crowd-output" not in caplog.text
         assert "Input video not found" in caplog.text
 
     def test_calibration_without_any_measurement_stream_is_rejected(
@@ -135,7 +135,7 @@ class TestFlags:
             ]
         )
         assert code == EXIT_ERROR
-        assert "--behavior-output or --interaction-output" in caplog.text
+        assert "--behavior-output, --interaction-output or --crowd-output" in caplog.text
 
     def test_interaction_output_needs_a_camera_id(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

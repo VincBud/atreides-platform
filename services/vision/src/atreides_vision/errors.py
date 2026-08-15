@@ -55,6 +55,20 @@ class InteractionOutputError(AtreidesVisionError):
     """Raised when the interaction stream cannot be created or written."""
 
 
+class CrowdError(AtreidesVisionError):
+    """Raised when spatial-cluster measurement is asked for the impossible.
+
+    Covers subjects that cannot be clustered together (different cameras,
+    different coordinate spaces, different venues or surfaces) and geometry that
+    cannot be computed. Each would otherwise produce a confident cluster
+    describing an arrangement that is not real.
+    """
+
+
+class CrowdOutputError(AtreidesVisionError):
+    """Raised when the crowd stream cannot be created or written."""
+
+
 class CalibrationError(AtreidesVisionError):
     """Raised when a ground-plane calibration is missing, malformed or unusable.
 

@@ -62,6 +62,9 @@ from atreides_vision.config import (
     resolve_camera_id,
     resolve_device,
 )
+from atreides_vision.crowd.analyzer import SpatialClusterAnalyzer
+from atreides_vision.crowd.config import CrowdAnalysisConfig
+from atreides_vision.crowd.reporting import CrowdRunMetadata, JsonlCrowdWriter
 from atreides_vision.detection.rfdetr import RFDetrPersonDetector
 from atreides_vision.errors import AtreidesVisionError, ConfigurationError
 from atreides_vision.interaction.analyzer import InteractionAnalyzer
@@ -267,6 +270,20 @@ def build_parser() -> argparse.ArgumentParser:
             "internally, so --behavior-output is not required. Neutral geometry "
             "only — separation, closing speed, relative direction of travel, time "
             "spent close. Pairs are same-camera only."
+        ),
+    )
+    run_parser.add_argument(
+        "--crowd-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write spatial-cluster and crowd measurements as JSON Lines "
+            "(e.g. artifacts/crowd.jsonl). Enables behaviour analysis internally, so "
+            "neither --behavior-output nor --interaction-output is required. Neutral "
+            "geometry only — cluster membership, centroid, spread, local density, "
+            "heading coherence. A spatial cluster is not a social group, and clusters "
+            "are same-camera only."
         ),
     )
     run_parser.add_argument(
@@ -605,6 +622,47 @@ def _build_interaction_metadata(
     )
 
 
+def _build_crowd_analyzer(
+    camera_id: str,
+    analyzer: BehaviorAnalyzer,
+    calibration_fit: CalibrationFit | None,
+) -> SpatialClusterAnalyzer:
+    """Build the cluster analyzer for the same space the behaviour layer uses.
+
+    The context is taken from the behaviour analyzer rather than re-derived, so
+    the layers cannot disagree about which space, venue or surface they measure
+    in.
+    """
+    if calibration_fit is None:
+        context = SpatialContext(camera_id=camera_id, space=analyzer.space)
+        config = CrowdAnalysisConfig.for_normalized_image()
+    else:
+        calibration = calibration_fit.calibration
+        context = SpatialContext(
+            camera_id=camera_id,
+            space=analyzer.space,
+            venue_id=calibration.venue_id,
+            surface_id=calibration.surface_id,
+        )
+        config = CrowdAnalysisConfig.for_ground_plane_metres()
+    return SpatialClusterAnalyzer(context, config)
+
+
+def _build_crowd_metadata(analyzer: SpatialClusterAnalyzer) -> CrowdRunMetadata:
+    """The crowd stream's header, from the analyzer's own context and settings."""
+    context = analyzer.context
+    config = analyzer.config
+    return CrowdRunMetadata(
+        camera_id=context.camera_id,
+        space=context.space,
+        venue_id=context.venue_id,
+        surface_id=context.surface_id,
+        cluster_radius=config.cluster_radius,
+        density_radius=config.density_radius,
+        minimum_cluster_size=config.minimum_cluster_size,
+    )
+
+
 def _build_run_metadata(
     camera_id: str,
     analyzer: BehaviorAnalyzer,
@@ -672,10 +730,11 @@ def _run_command(args: argparse.Namespace) -> int:
         args.calibration is not None
         and args.behavior_output is None
         and args.interaction_output is None
+        and args.crowd_output is None
     ):
         raise ConfigurationError(
-            "--calibration only affects behaviour and interaction measurement, so it needs "
-            "--behavior-output or --interaction-output. Use 'atreides-vision calibration "
+            "--calibration only affects measurement, so it needs --behavior-output, "
+            "--interaction-output or --crowd-output. Use 'atreides-vision calibration "
             "validate' to check a calibration on its own."
         )
 
@@ -700,7 +759,15 @@ def _run_command(args: argparse.Namespace) -> int:
     # Interaction measurement is built on behaviour snapshots, so asking for it
     # turns the behaviour analyzer on. Writing behaviour JSONL stays a separate
     # choice: nobody should have to produce one file to get another.
-    behavior_enabled = args.behavior_output is not None or args.interaction_output is not None
+    # Interaction and crowd measurement are both built on behaviour snapshots, so
+    # asking for either turns the behaviour analyzer on. Writing behaviour JSONL
+    # stays a separate choice: nobody should have to produce one file to get
+    # another, and the three streams are independent.
+    behavior_enabled = (
+        args.behavior_output is not None
+        or args.interaction_output is not None
+        or args.crowd_output is not None
+    )
     camera_id = (
         resolve_camera_id(
             explicit=args.camera_id,
@@ -741,11 +808,19 @@ def _run_command(args: argparse.Namespace) -> int:
             if behavior_analyzer is None or camera_id is None or args.interaction_output is None
             else _build_interaction_analyzer(camera_id, behavior_analyzer, calibration_fit)
         )
+        # A third consumer of the one behaviour analyzer built above; the frame
+        # is analysed once per frame and fanned out, never re-projected.
+        crowd_analyzer = (
+            None
+            if behavior_analyzer is None or camera_id is None or args.crowd_output is None
+            else _build_crowd_analyzer(camera_id, behavior_analyzer, calibration_fit)
+        )
 
         _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
         _log_behavior_startup(behavior_analyzer, calibration_fit, args.behavior_output)
         _log_integrity_startup(integrity_guard, args.calibration_reference)
         _log_interaction_startup(interaction_analyzer, args.interaction_output)
+        _log_crowd_startup(crowd_analyzer, args.crowd_output)
         if args.behavior_output_interval is not None:
             logger.info(
                 "  emission:  one snapshot per %.2f s of source time "
@@ -806,6 +881,18 @@ def _run_command(args: argparse.Namespace) -> int:
                 )
             )
 
+            crowd_writer = (
+                None
+                if crowd_analyzer is None
+                else stack.enter_context(
+                    JsonlCrowdWriter(
+                        args.crowd_output,
+                        _build_crowd_metadata(crowd_analyzer),
+                        emission_policy=_build_emission_policy(args.behavior_output_interval),
+                    )
+                )
+            )
+
             processor = VideoProcessor(
                 detector=detector,
                 tracker=tracker,
@@ -818,6 +905,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 integrity_guard=integrity_guard,
                 interaction_analyzer=interaction_analyzer,
                 interaction_writer=interaction_writer,
+                crowd_analyzer=crowd_analyzer,
+                crowd_writer=crowd_writer,
             )
             result = processor.run(source, sink)
 
@@ -825,6 +914,7 @@ def _run_command(args: argparse.Namespace) -> int:
     _log_behavior_completion(behavior_analyzer, args.behavior_output, result)
     _log_integrity_completion(integrity_guard, result)
     _log_interaction_completion(interaction_analyzer, args.interaction_output, result)
+    _log_crowd_completion(crowd_analyzer, args.crowd_output, result)
     return EXIT_OK
 
 
@@ -911,6 +1001,39 @@ def _log_interaction_completion(
         "Interaction pairs:   %d measured of %d candidate(s) -> %s",
         result.interaction_pairs_measured,
         analyzer.candidate_pairs_seen,
+        output_path,
+    )
+
+
+def _log_crowd_startup(analyzer: SpatialClusterAnalyzer | None, output_path: Path | None) -> None:
+    if analyzer is None:
+        logger.info("Crowd:       disabled (pass --crowd-output to measure spatial clusters)")
+        return
+    config = analyzer.config
+    unit = analyzer.space.distance_unit
+    logger.info("Crowd:       %s -> %s", analyzer.camera_id, output_path)
+    logger.info(
+        "  clusters:  same-camera only | connect <= %.2f %s | min size %d | density r=%.2f %s",
+        config.cluster_radius,
+        unit,
+        config.minimum_cluster_size,
+        config.density_radius,
+        unit,
+    )
+    logger.info("  note:      a spatial cluster is a geometric arrangement, not a social group")
+
+
+def _log_crowd_completion(
+    analyzer: SpatialClusterAnalyzer | None,
+    output_path: Path | None,
+    result: ProcessingResult,
+) -> None:
+    if analyzer is None:
+        return
+    logger.info(
+        "Spatial clusters:    %d measured from %d pair comparison(s) -> %s",
+        result.crowd_clusters_measured,
+        analyzer.pair_comparisons,
         output_path,
     )
 

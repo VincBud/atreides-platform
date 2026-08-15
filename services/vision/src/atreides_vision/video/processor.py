@@ -32,6 +32,9 @@ from atreides_vision.behavior.models import BehaviorFrame
 from atreides_vision.behavior.reporting import BehaviorWriter
 from atreides_vision.calibration.integrity.policy import CalibrationIntegrityGuard
 from atreides_vision.config import VisionConfig
+from atreides_vision.crowd.analyzer import SpatialClusterAnalyzer
+from atreides_vision.crowd.models import CrowdFrame
+from atreides_vision.crowd.reporting import CrowdWriter
 from atreides_vision.detection.base import PersonDetector
 from atreides_vision.detection.deduplication import deduplicate_with_report
 from atreides_vision.interaction.analyzer import InteractionAnalyzer
@@ -112,6 +115,10 @@ class ProcessingResult:
     final_interaction_frame: InteractionFrame | None = None
     #: Pair measurements produced across the run. Always 0 without an analyzer.
     interaction_pairs_measured: int = 0
+    #: Final spatial clusters, or ``None`` without a crowd analyzer.
+    final_crowd_frame: CrowdFrame | None = None
+    #: Cluster measurements produced across the run. Always 0 without an analyzer.
+    crowd_clusters_measured: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -145,6 +152,8 @@ class VideoProcessor:
         integrity_guard: CalibrationIntegrityGuard | None = None,
         interaction_analyzer: InteractionAnalyzer | None = None,
         interaction_writer: InteractionWriter | None = None,
+        crowd_analyzer: SpatialClusterAnalyzer | None = None,
+        crowd_writer: CrowdWriter | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -159,6 +168,8 @@ class VideoProcessor:
         self._integrity_guard = integrity_guard
         self._interaction_analyzer = interaction_analyzer
         self._interaction_writer = interaction_writer
+        self._crowd_analyzer = crowd_analyzer
+        self._crowd_writer = crowd_writer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -190,6 +201,7 @@ class VideoProcessor:
         zone_report: ZoneReport | None = None
         behavior_frame: BehaviorFrame | None = None
         interaction_frame: InteractionFrame | None = None
+        crowd_frame: CrowdFrame | None = None
 
         deduplicate = self._config.pipeline.deduplicate_detections
         detections_removed = 0
@@ -309,6 +321,15 @@ class VideoProcessor:
                     if self._interaction_writer is not None and output_trusted:
                         self._interaction_writer.write_frame(interaction_frame)
 
+                if self._crowd_analyzer is not None:
+                    # A third consumer of the same BehaviorFrame — the frame is
+                    # analysed once and fanned out, never re-projected. Cluster
+                    # persistence likewise updates every frame regardless of
+                    # emission.
+                    crowd_frame = self._crowd_analyzer.update(behavior_frame)
+                    if self._crowd_writer is not None and output_trusted:
+                        self._crowd_writer.write_frame(crowd_frame)
+
             fps_meter.tick()
             status = StatusOverlay(
                 frame_index=frame_index,
@@ -347,6 +368,10 @@ class VideoProcessor:
                 0
                 if self._interaction_analyzer is None
                 else self._interaction_analyzer.pairs_analysed
+            ),
+            final_crowd_frame=crowd_frame,
+            crowd_clusters_measured=(
+                0 if self._crowd_analyzer is None else self._crowd_analyzer.clusters_measured
             ),
         )
 

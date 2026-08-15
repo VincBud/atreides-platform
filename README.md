@@ -1,4 +1,4 @@
-# Atreides — V0.3.4: INTERACTION SIGNALS (in progress)
+# Atreides — V0.3.5: SPATIAL CLUSTER & CROWD DYNAMICS (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -33,6 +33,10 @@ deliberately narrow:
     subjects on one camera: separation, closing speed, relative direction of travel,
     time spent close.
     See [docs/vision/V0.3.4_INTERACTION_SIGNALS.md](docs/vision/V0.3.4_INTERACTION_SIGNALS.md).
+  - **V0.3.5 — spatial cluster & crowd dynamics.** ✅ Neutral frame-local measurement
+    across several subjects on one camera: which are spatially connected, how spread
+    out, how locally dense, how aligned in motion, and for how long.
+    See [docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -129,6 +133,13 @@ uv run atreides-vision run \
   --interaction-output artifacts/interactions.jsonl \
   --calibration config/calibration.example.json
 
+# V0.3 — spatial cluster / crowd measurement (metric)
+uv run atreides-vision run \
+  --input data/input/test.mp4 \
+  --output artifacts/tracked.mp4 \
+  --crowd-output artifacts/crowd.jsonl \
+  --calibration config/calibration.example.json
+
 # V0.3 — with behaviour signals (camera-local, normalized units)
 uv run atreides-vision run \
   --input data/input/test.mp4 \
@@ -185,8 +196,9 @@ Every run after that is fully offline.
 | `--camera-id` | from config | Camera namespace for behaviour records |
 | `--calibration-reference` | off | Reference frame enabling camera-drift monitoring. Needs `--calibration` |
 | `--integrity-report-only` | off | Keep emitting after drift is detected (diagnostic; output may be wrong) |
-| `--behavior-output-interval` | every frame | Seconds of source time between emitted behaviour snapshots |
+| `--behavior-output-interval` | every frame | Seconds of source time between emitted records, on all three streams |
 | `--interaction-output` | off | Write pairwise interaction measurements as JSON Lines. Enables behaviour analysis internally |
+| `--crowd-output` | off | Write spatial-cluster and crowd measurements as JSON Lines. Enables behaviour analysis internally |
 | `--trail-length` | `25` | Centre points kept and drawn per track |
 | `--no-confidence-labels` | off | Draw `ID <n>` without the score |
 | `--log-every` | `100` | Progress log interval, in frames |
@@ -448,6 +460,13 @@ atreides-platform/
 │   │   │   │   ├── history.py            # bounded per-pair separation history
 │   │   │   │   ├── analyzer.py           # the facade VideoProcessor orchestrates
 │   │   │   │   └── reporting.py          # schema 0.3.4 JSONL stream
+│   │   │   ├── crowd/               # V0.3.5 spatial cluster measurement
+│   │   │   │   ├── models.py             # ClusterMembers, snapshots, CrowdFrame
+│   │   │   │   ├── geometry.py           # pure spatial maths (spread, density)
+│   │   │   │   ├── clustering.py         # radius graph and connected components
+│   │   │   │   ├── history.py            # per-composition persistence, bounded
+│   │   │   │   ├── analyzer.py           # the facade VideoProcessor orchestrates
+│   │   │   │   └── reporting.py          # schema 0.3.5 JSONL stream
 │   │   │   ├── calibration/         # V0.3.1 ground-plane calibration
 │   │   │   │   ├── homography.py        # normalized DLT — pure array maths
 │   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
@@ -552,9 +571,9 @@ libraries, web frameworks, Docker.
 ## Current milestone — V0.3: BEHAVIOR SIGNALS
 
 V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
-behaviour signals. **V0.3.0 through V0.3.4 are built**: the signal foundation,
-ground-plane calibration, runtime exposure, calibration-integrity monitoring, and
-pairwise interaction measurement.
+behaviour signals. **V0.3.0 through V0.3.5 are built**: the signal foundation,
+ground-plane calibration, runtime exposure, calibration-integrity monitoring,
+pairwise interaction measurement, and spatial-cluster measurement.
 
 Four neutral measurements per tracked subject per frame: `speed`, `acceleration`,
 `heading_change_rate` and `stationary_duration`. Each carries its subject, timestamp,
@@ -673,12 +692,39 @@ Everything is a measurement. There is no confrontation, aggression, threat, conf
 or escalation signal — those need evidence Atreides does not have, and a layer that
 measured *and* judged would make both jobs impossible to audit.
 
+### V0.3.5 — spatial cluster & crowd dynamics
+
+V0.3.4 measured people two at a time. V0.3.5 measures the arrangement of *several*
+at once: which subjects are **spatially connected**, the cluster's **centroid** and
+**spread**, its **mean and maximum member separation**, the **local density** around
+each member, how **aligned their directions of travel** are, and how long that exact
+composition has **persisted**. `--crowd-output` writes them to their own versioned
+JSONL stream (schema `0.3.5`) and enables behaviour analysis internally.
+
+Clusters are connected components under a radius rule, so **they chain**: four people
+1.4 m apart in a line are one cluster under a 1.5 m radius even though the ends are
+4.2 m apart. That is the rule, not a defect — it is what makes a queue register as one
+arrangement instead of fragmenting into pairs.
+
+**A spatial cluster is not a social group.** It is a set of camera-local tracklets that
+were geometrically connected at one instant, and `member_count` is a tracklet count,
+not a headcount. Clustering is same-camera only and rejected across cameras, exactly
+as pairing is.
+
+Perspective is why calibration matters here: at a fixed normalized radius, the same
+three people **cluster at the back of the room and do not at the front**, because a
+fixed fraction of the frame covers less floor as they approach. Calibrated, both
+depths recover the same arrangement to 1e-4.
+
+There is no crowd risk score, density verdict, surge, crush, panic or unrest signal.
+
 Full detail and the complete limitation lists:
 [V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
 [V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md) ·
 [V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md) ·
 [V0.3.3](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md) ·
-[V0.3.4](docs/vision/V0.3.4_INTERACTION_SIGNALS.md).
+[V0.3.4](docs/vision/V0.3.4_INTERACTION_SIGNALS.md) ·
+[V0.3.5](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.
