@@ -64,6 +64,13 @@ from atreides_vision.config import (
 )
 from atreides_vision.detection.rfdetr import RFDetrPersonDetector
 from atreides_vision.errors import AtreidesVisionError, ConfigurationError
+from atreides_vision.interaction.analyzer import InteractionAnalyzer
+from atreides_vision.interaction.config import InteractionAnalysisConfig
+from atreides_vision.interaction.models import SpatialContext
+from atreides_vision.interaction.reporting import (
+    InteractionRunMetadata,
+    JsonlInteractionWriter,
+)
 from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.tracking.bytetrack import ByteTrackTracker
 from atreides_vision.tracking.diagnostics import JsonlTrackingDebugWriter
@@ -247,6 +254,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Switches behaviour measurement from normalized image units to venue "
             "metres. Requires --behavior-output. An invalid calibration is an error, "
             "never a silent fallback to normalized units."
+        ),
+    )
+    run_parser.add_argument(
+        "--interaction-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write pairwise interaction measurements as JSON Lines "
+            "(e.g. artifacts/interactions.jsonl). Enables behaviour analysis "
+            "internally, so --behavior-output is not required. Neutral geometry "
+            "only — separation, closing speed, relative direction of travel, time "
+            "spent close. Pairs are same-camera only."
         ),
     )
     run_parser.add_argument(
@@ -545,6 +565,46 @@ def _build_emission_policy(interval_seconds: float | None) -> BehaviorEmissionPo
     return IntervalEmissionPolicy(interval_seconds)
 
 
+def _build_interaction_analyzer(
+    camera_id: str,
+    analyzer: BehaviorAnalyzer,
+    calibration_fit: CalibrationFit | None,
+) -> InteractionAnalyzer:
+    """Build the pairwise analyzer for the same space the behaviour layer uses.
+
+    The context is taken from the behaviour analyzer rather than re-derived, so
+    the two layers cannot disagree about which space, venue or surface they are
+    measuring in.
+    """
+    if calibration_fit is None:
+        context = SpatialContext(camera_id=camera_id, space=analyzer.space)
+        config = InteractionAnalysisConfig.for_normalized_image()
+    else:
+        calibration = calibration_fit.calibration
+        context = SpatialContext(
+            camera_id=camera_id,
+            space=analyzer.space,
+            venue_id=calibration.venue_id,
+            surface_id=calibration.surface_id,
+        )
+        config = InteractionAnalysisConfig.for_ground_plane_metres()
+    return InteractionAnalyzer(context, config)
+
+
+def _build_interaction_metadata(
+    analyzer: InteractionAnalyzer,
+) -> InteractionRunMetadata:
+    """The interaction stream's header, from the analyzer's own context."""
+    context = analyzer.context
+    return InteractionRunMetadata(
+        camera_id=context.camera_id,
+        space=context.space,
+        venue_id=context.venue_id,
+        surface_id=context.surface_id,
+        proximity_threshold=analyzer.config.proximity_threshold,
+    )
+
+
 def _build_run_metadata(
     camera_id: str,
     analyzer: BehaviorAnalyzer,
@@ -608,10 +668,14 @@ def _run_command(args: argparse.Namespace) -> int:
             "--integrity-report-only changes what happens when drift is detected, so it "
             "needs --calibration-reference to detect any."
         )
-    if args.calibration is not None and args.behavior_output is None:
+    if (
+        args.calibration is not None
+        and args.behavior_output is None
+        and args.interaction_output is None
+    ):
         raise ConfigurationError(
-            "--calibration only affects behaviour measurement, so it needs "
-            "--behavior-output artifacts/behavior.jsonl. Use 'atreides-vision calibration "
+            "--calibration only affects behaviour and interaction measurement, so it needs "
+            "--behavior-output or --interaction-output. Use 'atreides-vision calibration "
             "validate' to check a calibration on its own."
         )
 
@@ -633,7 +697,10 @@ def _run_command(args: argparse.Namespace) -> int:
     # Fails before the detector loads if the reference is missing or unreadable.
     integrity_guard = _build_integrity_guard(args.calibration_reference, args.integrity_report_only)
 
-    behavior_enabled = args.behavior_output is not None
+    # Interaction measurement is built on behaviour snapshots, so asking for it
+    # turns the behaviour analyzer on. Writing behaviour JSONL stays a separate
+    # choice: nobody should have to produce one file to get another.
+    behavior_enabled = args.behavior_output is not None or args.interaction_output is not None
     camera_id = (
         resolve_camera_id(
             explicit=args.camera_id,
@@ -669,10 +736,16 @@ def _run_command(args: argparse.Namespace) -> int:
             if camera_id is None
             else _build_behavior_analyzer(camera_id, metadata, calibration_fit)
         )
+        interaction_analyzer = (
+            None
+            if behavior_analyzer is None or camera_id is None or args.interaction_output is None
+            else _build_interaction_analyzer(camera_id, behavior_analyzer, calibration_fit)
+        )
 
         _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
         _log_behavior_startup(behavior_analyzer, calibration_fit, args.behavior_output)
         _log_integrity_startup(integrity_guard, args.calibration_reference)
+        _log_interaction_startup(interaction_analyzer, args.interaction_output)
         if args.behavior_output_interval is not None:
             logger.info(
                 "  emission:  one snapshot per %.2f s of source time "
@@ -721,6 +794,18 @@ def _run_command(args: argparse.Namespace) -> int:
                 )
             )
 
+            interaction_writer = (
+                None
+                if interaction_analyzer is None
+                else stack.enter_context(
+                    JsonlInteractionWriter(
+                        args.interaction_output,
+                        _build_interaction_metadata(interaction_analyzer),
+                        emission_policy=_build_emission_policy(args.behavior_output_interval),
+                    )
+                )
+            )
+
             processor = VideoProcessor(
                 detector=detector,
                 tracker=tracker,
@@ -731,12 +816,15 @@ def _run_command(args: argparse.Namespace) -> int:
                 behavior_analyzer=behavior_analyzer,
                 behavior_writer=behavior_writer,
                 integrity_guard=integrity_guard,
+                interaction_analyzer=interaction_analyzer,
+                interaction_writer=interaction_writer,
             )
             result = processor.run(source, sink)
 
     _log_completion(result, analyzer, args.metrics_output)
     _log_behavior_completion(behavior_analyzer, args.behavior_output, result)
     _log_integrity_completion(integrity_guard, result)
+    _log_interaction_completion(interaction_analyzer, args.interaction_output, result)
     return EXIT_OK
 
 
@@ -791,6 +879,40 @@ def _log_behavior_completion(
             "(anchor at or beyond the calibration's horizon)",
             analyzer.unprojectable_observations,
         )
+
+
+def _log_interaction_startup(
+    analyzer: InteractionAnalyzer | None, output_path: Path | None
+) -> None:
+    if analyzer is None:
+        logger.info(
+            "Interaction: disabled (pass --interaction-output to measure pairwise geometry)"
+        )
+        return
+    logger.info("Interaction: %s -> %s", analyzer.camera_id, output_path)
+    logger.info(
+        "  pairs:     same-camera only | proximity <= %.2f %s | %s",
+        analyzer.config.proximity_threshold,
+        analyzer.space.distance_unit,
+        "no distance gate"
+        if analyzer.config.max_pair_distance is None
+        else f"gated beyond {analyzer.config.max_pair_distance:.1f} {analyzer.space.distance_unit}",
+    )
+
+
+def _log_interaction_completion(
+    analyzer: InteractionAnalyzer | None,
+    output_path: Path | None,
+    result: ProcessingResult,
+) -> None:
+    if analyzer is None:
+        return
+    logger.info(
+        "Interaction pairs:   %d measured of %d candidate(s) -> %s",
+        result.interaction_pairs_measured,
+        analyzer.candidate_pairs_seen,
+        output_path,
+    )
 
 
 def _log_integrity_startup(

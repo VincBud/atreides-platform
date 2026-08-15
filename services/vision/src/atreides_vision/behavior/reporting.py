@@ -41,8 +41,6 @@ no name, no demographic attribute, and no semantic behaviour label.
 
 from __future__ import annotations
 
-import gzip
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +54,7 @@ from atreides_vision.behavior.models import (
     BehaviorSubjectSnapshot,
 )
 from atreides_vision.errors import BehaviorOutputError
+from atreides_vision.jsonl import GZIP_SUFFIX, JsonlStreamWriter
 from atreides_vision.sampling import IntervalSampler
 
 logger = logging.getLogger(__name__)
@@ -111,11 +110,6 @@ _POSITION_PRECISION = 6
 _VALUE_PRECISION = 6
 _TIMESTAMP_PRECISION = 3
 _QUALITY_PRECISION = 3
-
-#: Output paths ending in this are gzip-compressed automatically. One
-#: convention, visible in the filename, so a reader can tell what a file is
-#: without a flag having been recorded anywhere.
-GZIP_SUFFIX = ".gz"
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,39 +382,19 @@ class JsonlBehaviorWriter:
         emission_policy: BehaviorEmissionPolicy | None = None,
         compress: bool | None = None,
     ) -> None:
-        self._path = Path(path)
         self._metadata = metadata
         self._policy = emission_policy or EmitEveryFrame()
-        self._compressed = (
-            self._path.suffix.lower() == GZIP_SUFFIX if compress is None else compress
-        )
+        self._stream = JsonlStreamWriter(path, BehaviorOutputError, "behaviour output", compress)
         self._records_written = 0
         self._frames_written = 0
         self._frames_analysed = 0
         self._integrity_records_written = 0
-        self._released = False
-
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            # gzip.open in text mode streams: each write is compressed and
-            # flushed into the file, so memory does not grow with run length.
-            # Deliberately long-lived: this class *is* the context manager, and
-            # the handle is closed by release(). ruff cannot see that ownership.
-            self._handle = (
-                gzip.open(self._path, "wt", encoding="utf-8")  # noqa: SIM115
-                if self._compressed
-                else self._path.open("w", encoding="utf-8")
-            )
-        except OSError as exc:
-            raise BehaviorOutputError(
-                f"Could not open behaviour output {self._path}: {exc}"
-            ) from exc
 
         self._write_line(metadata.to_record())
 
     @property
     def path(self) -> Path:
-        return self._path
+        return self._stream.path
 
     @property
     def metadata(self) -> BehaviorRunMetadata:
@@ -452,7 +426,7 @@ class JsonlBehaviorWriter:
 
     @property
     def is_compressed(self) -> bool:
-        return self._compressed
+        return self._stream.is_compressed
 
     def write_frame(self, frame: BehaviorFrame) -> None:
         """Append one line per subject observed in this frame, if it is due.
@@ -461,8 +435,10 @@ class JsonlBehaviorWriter:
         policy only decides whether this one is serialised. A frame with no
         subjects writes nothing, so an empty scene costs no file space.
         """
-        if self._released:
-            raise BehaviorOutputError(f"Cannot write to a released behaviour writer: {self._path}")
+        if self._stream.is_released:
+            raise BehaviorOutputError(
+                f"Cannot write to a released behaviour writer: {self._stream.path}"
+            )
         self._frames_analysed += 1
 
         if not self._policy.should_emit(frame.frame_index, frame.timestamp_seconds):
@@ -479,34 +455,23 @@ class JsonlBehaviorWriter:
         Never sampled: integrity findings are rare, and a suppressed one would
         leave a consumer unable to explain a gap in the observations.
         """
-        if self._released:
-            raise BehaviorOutputError(f"Cannot write to a released behaviour writer: {self._path}")
+        if self._stream.is_released:
+            raise BehaviorOutputError(
+                f"Cannot write to a released behaviour writer: {self._stream.path}"
+            )
         self._write_line(integrity_record(assessment, self._metadata))
         self._integrity_records_written += 1
 
     def _write_line(self, record: dict[str, Any]) -> None:
-        """Serialise fully, then write once, so no half-record can reach disk."""
-        try:
-            line = json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n"
-        except (TypeError, ValueError) as exc:
-            raise BehaviorOutputError(
-                f"Could not serialise a behaviour record for {self._path}: {exc}"
-            ) from exc
-        try:
-            self._handle.write(line)
-        except OSError as exc:
-            raise BehaviorOutputError(
-                f"Could not write behaviour output to {self._path}: {exc}"
-            ) from exc
+        self._stream.write_record(record)
 
     def release(self) -> None:
         """Flush and close. Idempotent, and safe after an exception."""
-        if not getattr(self, "_released", False):
-            self._handle.close()
-            self._released = True
+        if not self._stream.is_released:
+            self._stream.release()
             logger.debug(
                 "Released behaviour writer %s after %d records across %d frames",
-                self._path,
+                self._stream.path,
                 self._records_written,
                 self._frames_written,
             )

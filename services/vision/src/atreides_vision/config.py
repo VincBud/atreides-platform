@@ -208,7 +208,8 @@ def resolve_camera_id(
 
     if not supplied:
         raise ConfigurationError(
-            "Behaviour output needs a camera id, and none was supplied. Pass --camera-id, "
+            "Behaviour and interaction output need a camera id, and none was supplied. "
+            "Pass --camera-id, "
             "or use a --calibration or --zones file that names the camera. It is not "
             "defaulted because records from different cameras would then share one id."
         )

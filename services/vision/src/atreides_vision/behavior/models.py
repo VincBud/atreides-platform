@@ -37,6 +37,7 @@ __all__ = [
     "BehaviorSignal",
     "BehaviorSubjectSnapshot",
     "SignalType",
+    "SubjectMotion",
     "SubjectRef",
     "unit_for",
 ]
@@ -233,6 +234,52 @@ class BehaviorSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class SubjectMotion:
+    """A subject's net displacement over a recent window, in its motion space.
+
+    The narrowest primitive needed by pairwise analysis: comparing how two
+    people are moving relative to each other requires each one's *direction*,
+    and the individual signals only carry the rate at which direction changes.
+
+    Exposed here rather than recomputed downstream so there is exactly one
+    motion history in the process. A second, independently-derived estimate
+    would drift out of agreement with the signals and be impossible to reconcile.
+    """
+
+    #: Net displacement over the window, in the space's distance units.
+    dx: float
+    dy: float
+    #: Time the displacement was measured over.
+    elapsed_seconds: float
+    space: MotionSpace
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.dx) and math.isfinite(self.dy)):
+            raise ValueError(f"SubjectMotion must be finite, got ({self.dx!r}, {self.dy!r})")
+        if self.elapsed_seconds < 0:
+            raise ValueError(
+                f"SubjectMotion.elapsed_seconds must be non-negative, got {self.elapsed_seconds!r}"
+            )
+
+    @property
+    def magnitude(self) -> float:
+        """Distance travelled in a straight line over the window."""
+        return math.hypot(self.dx, self.dy)
+
+    def heading_radians(self, min_displacement: float) -> float | None:
+        """Direction of travel, or ``None`` when there is too little movement.
+
+        Measured with ``atan2(dy, dx)`` in the active space, matching
+        :func:`~atreides_vision.behavior.kinematics.heading_radians`. A subject
+        who barely moved has no direction of travel — returning an angle derived
+        from box jitter would manufacture one.
+        """
+        if self.magnitude < min_displacement:
+            return None
+        return math.atan2(self.dy, self.dx)
+
+
+@dataclass(frozen=True, slots=True)
 class BehaviorSubjectSnapshot:
     """One subject, at one frame: where it was, and what was measured about it.
 
@@ -255,12 +302,20 @@ class BehaviorSubjectSnapshot:
     signals: tuple[BehaviorSignal, ...] = field(default_factory=tuple)
     #: Opaque zone context supplied by the caller, never interpreted here.
     zone_ids: tuple[str, ...] = ()
+    #: Net displacement over the heading window, when enough history exists.
+    #: ``None`` for a freshly acquired track, and after a motion-segment break.
+    motion: SubjectMotion | None = None
 
     def __post_init__(self) -> None:
         if self.frame_index < 0:
             raise ValueError(
                 "BehaviorSubjectSnapshot.frame_index must be non-negative, "
                 f"got {self.frame_index!r}"
+            )
+        if self.motion is not None and self.motion.space is not self.position.space:
+            raise ValueError(
+                "BehaviorSubjectSnapshot.motion must be in the same space as its position: "
+                f"{self.motion.space.value} vs {self.position.space.value}"
             )
 
     @property

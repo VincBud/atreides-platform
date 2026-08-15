@@ -41,6 +41,20 @@ class BehaviorOutputError(AtreidesVisionError):
     """Raised when the behaviour signal stream cannot be created or written."""
 
 
+class InteractionError(AtreidesVisionError):
+    """Raised when pairwise interaction measurement is asked for the impossible.
+
+    Covers pairs that cannot exist (a subject with itself, two subjects on
+    different cameras) and positions that cannot be compared (different
+    coordinate spaces, venues or surfaces). Every one of these would otherwise
+    produce a confident number describing a relationship that is not real.
+    """
+
+
+class InteractionOutputError(AtreidesVisionError):
+    """Raised when the interaction stream cannot be created or written."""
+
+
 class CalibrationError(AtreidesVisionError):
     """Raised when a ground-plane calibration is missing, malformed or unusable.
 

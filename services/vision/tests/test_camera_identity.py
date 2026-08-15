@@ -86,7 +86,7 @@ class TestConflicts:
 class TestMissing:
     def test_no_source_is_an_error_not_a_default(self) -> None:
         """A placeholder id would merge records from different cameras."""
-        with pytest.raises(ConfigurationError, match="needs a camera id"):
+        with pytest.raises(ConfigurationError, match="need a camera id"):
             resolve_camera_id()
 
     def test_the_message_says_how_to_supply_one(self) -> None:

@@ -39,6 +39,7 @@ from atreides_vision.behavior.kinematics import (
     acceleration,
     heading_change_rate,
     mean_speed,
+    net_displacement,
     span_seconds,
     stationary_since,
 )
@@ -48,6 +49,7 @@ from atreides_vision.behavior.models import (
     BehaviorSignal,
     BehaviorSubjectSnapshot,
     SignalType,
+    SubjectMotion,
     SubjectRef,
 )
 from atreides_vision.errors import ConfigurationError, ProjectionError
@@ -225,6 +227,7 @@ class BehaviorAnalyzer:
                     position=position,
                     signals=tuple(self._signals_for(history, observation)),
                     zone_ids=zone_ids,
+                    motion=self._motion_for(history),
                 )
             )
 
@@ -238,6 +241,26 @@ class BehaviorAnalyzer:
         self._signals_emitted += len(frame.signals)
         self._latest = frame
         return frame
+
+    def _motion_for(self, history: SubjectHistory) -> SubjectMotion | None:
+        """This subject's net displacement over the heading window.
+
+        Derived from the same history and the same window the heading signal
+        uses, so a consumer comparing two subjects' directions is comparing
+        quantities measured identically. ``None`` until there is history to
+        measure — never a zero vector, which would be indistinguishable from a
+        subject who genuinely did not move.
+        """
+        samples = history.recent(self._config.heading_window_seconds)
+        if len(samples) < 2:
+            return None
+        dx, dy = net_displacement(samples)
+        return SubjectMotion(
+            dx=dx,
+            dy=dy,
+            elapsed_seconds=span_seconds(samples),
+            space=self._projector.space,
+        )
 
     def _signals_for(
         self,

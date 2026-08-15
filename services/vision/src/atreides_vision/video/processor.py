@@ -34,6 +34,9 @@ from atreides_vision.calibration.integrity.policy import CalibrationIntegrityGua
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
 from atreides_vision.detection.deduplication import deduplicate_with_report
+from atreides_vision.interaction.analyzer import InteractionAnalyzer
+from atreides_vision.interaction.models import InteractionFrame
+from atreides_vision.interaction.reporting import InteractionWriter
 from atreides_vision.models import Track
 from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.tracking.diagnostics import (
@@ -100,9 +103,15 @@ class ProcessingResult:
     final_behavior_frame: BehaviorFrame | None = None
     #: Behaviour signals emitted across the run. Always 0 without an analyzer.
     behavior_signals_emitted: int = 0
-    #: Frames whose observations were withheld because camera drift was detected.
+    #: Frames whose measurement output was withheld because camera drift was
+    #: detected. Counted once per frame across every enabled stream, so it means
+    #: the same thing whether behaviour, interaction or both were being written.
     #: Always 0 without integrity monitoring, or when the camera stayed put.
     behavior_frames_suppressed: int = 0
+    #: Final pairwise measurements, or ``None`` without an interaction analyzer.
+    final_interaction_frame: InteractionFrame | None = None
+    #: Pair measurements produced across the run. Always 0 without an analyzer.
+    interaction_pairs_measured: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -134,6 +143,8 @@ class VideoProcessor:
         behavior_analyzer: BehaviorAnalyzer | None = None,
         behavior_writer: BehaviorWriter | None = None,
         integrity_guard: CalibrationIntegrityGuard | None = None,
+        interaction_analyzer: InteractionAnalyzer | None = None,
+        interaction_writer: InteractionWriter | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -146,6 +157,8 @@ class VideoProcessor:
         self._behavior_analyzer = behavior_analyzer
         self._behavior_writer = behavior_writer
         self._integrity_guard = integrity_guard
+        self._interaction_analyzer = interaction_analyzer
+        self._interaction_writer = interaction_writer
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -176,6 +189,7 @@ class VideoProcessor:
         metrics_records = 0
         zone_report: ZoneReport | None = None
         behavior_frame: BehaviorFrame | None = None
+        interaction_frame: InteractionFrame | None = None
 
         deduplicate = self._config.pipeline.deduplicate_detections
         detections_removed = 0
@@ -267,17 +281,33 @@ class VideoProcessor:
                     if assessment is not None and self._behavior_writer is not None:
                         self._behavior_writer.write_integrity(assessment)
 
-                if self._behavior_writer is not None:
-                    if self._integrity_guard is None or self._integrity_guard.metric_output_allowed:
-                        # Streamed per frame, never accumulated: a long run costs
-                        # no more memory than a short one.
-                        self._behavior_writer.write_frame(behavior_frame)
-                    else:
-                        # The camera has demonstrably moved. Withholding the
-                        # observations is the point: the calibration's metres no
-                        # longer describe this camera, and emitting them anyway
-                        # would look entirely normal downstream.
-                        self._integrity_guard.note_suppressed_frame()
+                # One trust decision, honoured by both streams. Pairwise metres
+                # are derived from the same positions, so output the calibration
+                # has disowned must not reappear as an interaction record.
+                output_trusted = (
+                    self._integrity_guard is None or self._integrity_guard.metric_output_allowed
+                )
+
+                if self._integrity_guard is not None and not output_trusted:
+                    # The camera has demonstrably moved. Withholding the output
+                    # is the point: the calibration's metres no longer describe
+                    # this camera, and emitting them anyway would look entirely
+                    # normal downstream. Counted per frame, not per stream, so
+                    # the figure means the same thing however many are enabled.
+                    self._integrity_guard.note_suppressed_frame()
+
+                if self._behavior_writer is not None and output_trusted:
+                    # Streamed per frame, never accumulated: a long run costs no
+                    # more memory than a short one.
+                    self._behavior_writer.write_frame(behavior_frame)
+
+                if self._interaction_analyzer is not None:
+                    # Pair history updates every frame regardless of whether the
+                    # result is serialised, so closing speed and proximity
+                    # duration are always built on the complete record.
+                    interaction_frame = self._interaction_analyzer.update(behavior_frame)
+                    if self._interaction_writer is not None and output_trusted:
+                        self._interaction_writer.write_frame(interaction_frame)
 
             fps_meter.tick()
             status = StatusOverlay(
@@ -311,6 +341,12 @@ class VideoProcessor:
             ),
             behavior_frames_suppressed=(
                 0 if self._integrity_guard is None else self._integrity_guard.suppressed_frames
+            ),
+            final_interaction_frame=interaction_frame,
+            interaction_pairs_measured=(
+                0
+                if self._interaction_analyzer is None
+                else self._interaction_analyzer.pairs_analysed
             ),
         )
 

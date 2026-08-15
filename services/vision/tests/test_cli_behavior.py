@@ -203,7 +203,7 @@ class TestBehaviorFailsBeforeModelLoad:
             ]
         )
         assert code == EXIT_ERROR
-        assert "needs a camera id" in caplog.text
+        assert "need a camera id" in caplog.text
 
     def test_calibration_is_validated_before_the_video_is_opened(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

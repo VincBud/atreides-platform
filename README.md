@@ -1,4 +1,4 @@
-# Atreides — V0.3.3: CALIBRATION INTEGRITY (in progress)
+# Atreides — V0.3.4: INTERACTION SIGNALS (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -29,6 +29,10 @@ deliberately narrow:
     moved and stops trusting its metres, passes zone labels into behaviour output, and
     adds output sampling and compression.
     See [docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md).
+  - **V0.3.4 — interaction signals.** ✅ Neutral pairwise measurement between two
+    subjects on one camera: separation, closing speed, relative direction of travel,
+    time spent close.
+    See [docs/vision/V0.3.4_INTERACTION_SIGNALS.md](docs/vision/V0.3.4_INTERACTION_SIGNALS.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -118,6 +122,13 @@ uv run atreides-vision run \
   --zones config/zones.example.json \
   --metrics-output artifacts/zone_metrics.jsonl
 
+# V0.3 — pairwise interaction measurement (metric)
+uv run atreides-vision run \
+  --input data/input/test.mp4 \
+  --output artifacts/tracked.mp4 \
+  --interaction-output artifacts/interactions.jsonl \
+  --calibration config/calibration.example.json
+
 # V0.3 — with behaviour signals (camera-local, normalized units)
 uv run atreides-vision run \
   --input data/input/test.mp4 \
@@ -175,6 +186,7 @@ Every run after that is fully offline.
 | `--calibration-reference` | off | Reference frame enabling camera-drift monitoring. Needs `--calibration` |
 | `--integrity-report-only` | off | Keep emitting after drift is detected (diagnostic; output may be wrong) |
 | `--behavior-output-interval` | every frame | Seconds of source time between emitted behaviour snapshots |
+| `--interaction-output` | off | Write pairwise interaction measurements as JSON Lines. Enables behaviour analysis internally |
 | `--trail-length` | `25` | Centre points kept and drawn per track |
 | `--no-confidence-labels` | off | Draw `ID <n>` without the score |
 | `--log-every` | `100` | Progress log interval, in frames |
@@ -430,6 +442,12 @@ atreides-platform/
 │   │   │   │   ├── kinematics.py        # pure formulas, no state
 │   │   │   │   ├── analyzer.py          # the facade VideoProcessor orchestrates
 │   │   │   │   └── reporting.py         # V0.3.2 versioned JSONL output contract
+│   │   │   ├── interaction/         # V0.3.4 pairwise measurement
+│   │   │   │   ├── models.py             # SubjectPairRef, SpatialContext, snapshots
+│   │   │   │   ├── geometry.py           # pure pairwise maths
+│   │   │   │   ├── history.py            # bounded per-pair separation history
+│   │   │   │   ├── analyzer.py           # the facade VideoProcessor orchestrates
+│   │   │   │   └── reporting.py          # schema 0.3.4 JSONL stream
 │   │   │   ├── calibration/         # V0.3.1 ground-plane calibration
 │   │   │   │   ├── homography.py        # normalized DLT — pure array maths
 │   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
@@ -534,8 +552,9 @@ libraries, web frameworks, Docker.
 ## Current milestone — V0.3: BEHAVIOR SIGNALS
 
 V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
-behaviour signals. **V0.3.0 through V0.3.3 are built**: the signal foundation,
-ground-plane calibration, runtime exposure, and calibration-integrity monitoring.
+behaviour signals. **V0.3.0 through V0.3.4 are built**: the signal foundation,
+ground-plane calibration, runtime exposure, calibration-integrity monitoring, and
+pairwise interaction measurement.
 
 Four neutral measurements per tracked subject per frame: `speed`, `acceleration`,
 `heading_change_rate` and `stationary_duration`. Each carries its subject, timestamp,
@@ -630,11 +649,36 @@ Behaviour output also gained volume control: `--behavior-output-interval` and gz
 a `.jsonl.gz` path. **Analysis is never sampled** — every frame is still analysed in
 full, so signals are unaffected and only serialisation is thinned.
 
+### V0.3.4 — interaction signals
+
+V0.3.0–V0.3.3 measured people one at a time. V0.3.4 measures how two observed
+subjects relate: **separation**, **closing speed** (positive means the gap is
+shrinking), **relative direction of travel**, and **time spent within a proximity
+threshold**. `--interaction-output` writes them to their own versioned JSONL stream
+(schema `0.3.4`) and enables behaviour analysis internally, so no behaviour file is
+required to get one.
+
+Verified against arithmetic: two people walking head-on at 1 m/s each close at
+exactly `+2.0000 m/s`; walking apart gives `−2.0000`; walking in parallel gives `0`.
+And two people a fixed 2 m apart measure **more than 1.5× differently in image space**
+depending on their depth in the frame, while calibration recovers `2.0000 m` at both.
+
+**Pairs are same-camera only, and that is deliberate.** `cam_A/track_7` is never
+paired with `cam_B/track_12` even when both project to nearly the same venue
+coordinates: without multi-camera association, one real person seen by two cameras
+would be paired *with themselves*. Cross-camera pairing is rejected at construction,
+not merely absent.
+
+Everything is a measurement. There is no confrontation, aggression, threat, conflict
+or escalation signal — those need evidence Atreides does not have, and a layer that
+measured *and* judged would make both jobs impossible to audit.
+
 Full detail and the complete limitation lists:
 [V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
 [V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md) ·
 [V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md) ·
-[V0.3.3](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md).
+[V0.3.3](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md) ·
+[V0.3.4](docs/vision/V0.3.4_INTERACTION_SIGNALS.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.
