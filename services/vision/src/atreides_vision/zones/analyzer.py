@@ -17,7 +17,7 @@ either leaves zone intelligence untouched.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from atreides_vision.models import Track
 from atreides_vision.zones.assignment import ZoneAssigner
@@ -46,6 +46,7 @@ class ZoneAnalyzer:
         self._movement = TrackMovementStore(self._config)
         self._metrics = ZoneMetricsCalculator(self._config)
         self._latest: ZoneReport | None = None
+        self._latest_zone_ids: dict[int, tuple[str, ...]] = {}
 
     @property
     def layout(self) -> ZoneLayout:
@@ -59,6 +60,24 @@ class ZoneAnalyzer:
     def latest_report(self) -> ZoneReport | None:
         """The most recent report, or ``None`` before the first frame."""
         return self._latest
+
+    @property
+    def zone_ids_by_track(self) -> Mapping[int, tuple[str, ...]]:
+        """Which zones each track was in on the most recent frame.
+
+        Exposed so a caller can attach zone labels to something else — V0.3.3
+        passes them to behaviour analysis as neutral context. Tracks in no zone
+        are absent from the mapping rather than present with an empty tuple, so
+        "outside every zone" needs no sentinel value.
+
+        Ids are ordered as the zones are configured, so the same scene always
+        produces the same ordering.
+
+        These are **camera-local, image-space** zones: a zone is a polygon drawn
+        on this camera's view. The id is a label, not a venue geometry, and
+        attaching it to a metric position does not make it one.
+        """
+        return self._latest_zone_ids
 
     def update(
         self,
@@ -83,6 +102,11 @@ class ZoneAnalyzer:
             Metrics for every configured zone.
         """
         assignment = self._assigner.assign(tracks, frame_width, frame_height, frame_index)
+        self._latest_zone_ids = {
+            track_id: zone_ids
+            for track_id in assignment.floor_points
+            if (zone_ids := assignment.zones_for_track(track_id))
+        }
 
         for track_id, point in assignment.floor_points.items():
             self._movement.observe(track_id, point, frame_index, timestamp_seconds)

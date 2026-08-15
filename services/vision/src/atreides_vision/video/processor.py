@@ -30,6 +30,7 @@ from pathlib import Path
 from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.models import BehaviorFrame
 from atreides_vision.behavior.reporting import BehaviorWriter
+from atreides_vision.calibration.integrity.policy import CalibrationIntegrityGuard
 from atreides_vision.config import VisionConfig
 from atreides_vision.detection.base import PersonDetector
 from atreides_vision.detection.deduplication import deduplicate_with_report
@@ -99,6 +100,9 @@ class ProcessingResult:
     final_behavior_frame: BehaviorFrame | None = None
     #: Behaviour signals emitted across the run. Always 0 without an analyzer.
     behavior_signals_emitted: int = 0
+    #: Frames whose observations were withheld because camera drift was detected.
+    #: Always 0 without integrity monitoring, or when the camera stayed put.
+    behavior_frames_suppressed: int = 0
 
     @property
     def effective_fps(self) -> float:
@@ -129,6 +133,7 @@ class VideoProcessor:
         tracking_debug_writer: TrackingDebugWriter | None = None,
         behavior_analyzer: BehaviorAnalyzer | None = None,
         behavior_writer: BehaviorWriter | None = None,
+        integrity_guard: CalibrationIntegrityGuard | None = None,
     ) -> None:
         self._detector = detector
         self._tracker = tracker
@@ -140,6 +145,7 @@ class VideoProcessor:
         self._tracking_debug_writer = tracking_debug_writer
         self._behavior_analyzer = behavior_analyzer
         self._behavior_writer = behavior_writer
+        self._integrity_guard = integrity_guard
 
     def run(self, source: VideoSource, sink: VideoSink) -> ProcessingResult:
         """Process every frame of ``source`` into ``sink``.
@@ -236,18 +242,42 @@ class VideoProcessor:
             if self._behavior_analyzer is not None:
                 # Measurement only: the signals are written to their own stream
                 # and never drawn, so the rendered video is identical with and
-                # without behaviour enabled. Zone context is not passed through
-                # yet, which is why behaviour analysis works with or without
-                # zones configured.
+                # without behaviour enabled. Zone ids arrive as opaque labels —
+                # the behaviour layer never learns what a zone is, which is why
+                # this works with or without zones configured.
                 behavior_frame = self._behavior_analyzer.update(
                     tracks,
                     frame_index=frame_index,
                     timestamp_seconds=timestamp_seconds,
+                    zone_ids_by_track=(
+                        None
+                        if self._zone_analyzer is None
+                        else self._zone_analyzer.zone_ids_by_track
+                    ),
                 )
+
+                # Integrity runs on its own cadence, so this is a no-op on most
+                # frames. The guard owns the schedule, the thresholds and the
+                # policy; the processor only relays the finding and honours the
+                # verdict.
+                if self._integrity_guard is not None:
+                    assessment = self._integrity_guard.evaluate(
+                        frame, frame_index, timestamp_seconds
+                    )
+                    if assessment is not None and self._behavior_writer is not None:
+                        self._behavior_writer.write_integrity(assessment)
+
                 if self._behavior_writer is not None:
-                    # Streamed per frame, never accumulated: a long run costs no
-                    # more memory than a short one.
-                    self._behavior_writer.write_frame(behavior_frame)
+                    if self._integrity_guard is None or self._integrity_guard.metric_output_allowed:
+                        # Streamed per frame, never accumulated: a long run costs
+                        # no more memory than a short one.
+                        self._behavior_writer.write_frame(behavior_frame)
+                    else:
+                        # The camera has demonstrably moved. Withholding the
+                        # observations is the point: the calibration's metres no
+                        # longer describe this camera, and emitting them anyway
+                        # would look entirely normal downstream.
+                        self._integrity_guard.note_suppressed_frame()
 
             fps_meter.tick()
             status = StatusOverlay(
@@ -278,6 +308,9 @@ class VideoProcessor:
             final_behavior_frame=behavior_frame,
             behavior_signals_emitted=(
                 0 if self._behavior_analyzer is None else self._behavior_analyzer.signals_emitted
+            ),
+            behavior_frames_suppressed=(
+                0 if self._integrity_guard is None else self._integrity_guard.suppressed_frames
             ),
         )
 

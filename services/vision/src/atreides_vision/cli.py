@@ -28,12 +28,22 @@ from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.config import BehaviorAnalysisConfig
 from atreides_vision.behavior.coordinates import NormalizedFrameProjector
 from atreides_vision.behavior.reporting import (
+    BehaviorEmissionPolicy,
     BehaviorRunMetadata,
     CalibrationProvenance,
+    EmitEveryFrame,
+    IntervalEmissionPolicy,
     JsonlBehaviorWriter,
     SourceProvenance,
 )
 from atreides_vision.calibration.fitting import CalibrationFit
+from atreides_vision.calibration.integrity import (
+    CalibrationIntegrityConfig,
+    CalibrationIntegrityGuard,
+    CalibrationIntegrityMonitor,
+    IntegrityAssessment,
+    IntegrityPolicyMode,
+)
 from atreides_vision.calibration.loader import load_calibration_fit
 from atreides_vision.calibration.projector import GroundPlaneProjector
 from atreides_vision.config import (
@@ -64,6 +74,7 @@ from atreides_vision.video.source import FileVideoSource, VideoMetadata, read_re
 from atreides_vision.visualization.calibration_overlay import (
     CalibrationOverlayConfig,
     render_calibration_overlay,
+    render_integrity_overlay,
 )
 from atreides_vision.zones.analyzer import ZoneAnalyzer
 from atreides_vision.zones.loader import load_zone_layout
@@ -239,6 +250,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--calibration-reference",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Image (or video whose first frame is used) captured from the camera geometry "
+            "this calibration was authored against. Enables calibration-integrity "
+            "monitoring: if the camera view stops matching it, metric observations stop "
+            "rather than continuing from a calibration that no longer applies. "
+            "Requires --calibration."
+        ),
+    )
+    run_parser.add_argument(
+        "--integrity-report-only",
+        action="store_true",
+        help=(
+            "Record calibration-integrity findings but keep emitting metric observations "
+            "even after drift is detected. Diagnostic use only — the output may be wrong. "
+            "Requires --calibration-reference."
+        ),
+    )
+    run_parser.add_argument(
+        "--behavior-output-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Emit at most one behaviour snapshot per this many seconds of source time. "
+            "Analysis still runs on every frame, so signals are unaffected; this only "
+            "reduces how much is written. Omit to write every frame, as before."
+        ),
+    )
+    run_parser.add_argument(
         "--camera-id",
         type=str,
         default=None,
@@ -361,6 +405,42 @@ def _add_calibration_commands(
     )
     render_parser.set_defaults(handler=_calibration_render_command)
 
+    integrity_parser = calibration_sub.add_parser(
+        "integrity",
+        help="Check whether a camera's view still matches its calibration reference.",
+        description=(
+            "Register a current frame against the reference frame the calibration was "
+            "authored against, and report whether the camera geometry still matches. "
+            "This checks that the view has not moved. It cannot check whether the "
+            "calibration's metres were ever correct."
+        ),
+    )
+    integrity_parser.add_argument(
+        "--calibration", type=Path, required=True, metavar="PATH", help="Calibration JSON."
+    )
+    integrity_parser.add_argument(
+        "--reference",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Reference image or video from the calibrated camera geometry.",
+    )
+    integrity_parser.add_argument(
+        "--current",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Current image, or video whose first frame is used.",
+    )
+    integrity_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Optional annotated image showing matched scene features and the drift.",
+    )
+    integrity_parser.set_defaults(handler=_calibration_integrity_command)
+
 
 def build_tracker(choice: Tracker, config: TrackerConfig) -> MultiObjectTracker:
     """Construct the selected tracker adapter.
@@ -431,6 +511,40 @@ def _build_behavior_analyzer(
     )
 
 
+def _build_integrity_guard(
+    reference_path: Path | None,
+    report_only: bool,
+) -> CalibrationIntegrityGuard | None:
+    """Load the integrity reference and build the guard, or return ``None``.
+
+    Failing here — a missing or unreadable reference — stops the run before the
+    detector loads, rather than leaving monitoring quietly disabled on a run the
+    operator asked to have guarded.
+    """
+    if reference_path is None:
+        return None
+
+    reference = read_reference_frame(reference_path)
+    config = CalibrationIntegrityConfig(
+        policy_mode=(
+            IntegrityPolicyMode.REPORT_ONLY if report_only else IntegrityPolicyMode.GUARDED
+        )
+    )
+    monitor = CalibrationIntegrityMonitor(
+        reference_frame=reference,
+        config=config,
+        reference_id=str(reference_path),
+    )
+    return CalibrationIntegrityGuard(monitor, config)
+
+
+def _build_emission_policy(interval_seconds: float | None) -> BehaviorEmissionPolicy:
+    """Every frame by default; on an interval when one is configured."""
+    if interval_seconds is None:
+        return EmitEveryFrame()
+    return IntervalEmissionPolicy(interval_seconds)
+
+
 def _build_run_metadata(
     camera_id: str,
     analyzer: BehaviorAnalyzer,
@@ -483,6 +597,17 @@ def _run_command(args: argparse.Namespace) -> int:
             "--metrics-output needs zones to measure. Add --zones config/zones.example.json, "
             "or drop --metrics-output."
         )
+    if args.calibration_reference is not None and args.calibration is None:
+        raise ConfigurationError(
+            "--calibration-reference checks a calibration's camera geometry, so it needs "
+            "--calibration. Integrity monitoring does not apply to normalized behaviour "
+            "output, which makes no metric claim to invalidate."
+        )
+    if args.integrity_report_only and args.calibration_reference is None:
+        raise ConfigurationError(
+            "--integrity-report-only changes what happens when drift is detected, so it "
+            "needs --calibration-reference to detect any."
+        )
     if args.calibration is not None and args.behavior_output is None:
         raise ConfigurationError(
             "--calibration only affects behaviour measurement, so it needs "
@@ -504,6 +629,9 @@ def _run_command(args: argparse.Namespace) -> int:
     # geometry stops the run here rather than a thousand frames in.
     layout = None if args.zones is None else load_zone_layout(args.zones)
     calibration_fit = None if args.calibration is None else load_calibration_fit(args.calibration)
+
+    # Fails before the detector loads if the reference is missing or unreadable.
+    integrity_guard = _build_integrity_guard(args.calibration_reference, args.integrity_report_only)
 
     behavior_enabled = args.behavior_output is not None
     camera_id = (
@@ -544,6 +672,13 @@ def _run_command(args: argparse.Namespace) -> int:
 
         _log_startup(config, metadata, detector.name, tracker.name, layout, args.zones)
         _log_behavior_startup(behavior_analyzer, calibration_fit, args.behavior_output)
+        _log_integrity_startup(integrity_guard, args.calibration_reference)
+        if args.behavior_output_interval is not None:
+            logger.info(
+                "  emission:  one snapshot per %.2f s of source time "
+                "(analysis still runs on every frame)",
+                args.behavior_output_interval,
+            )
 
         logger.info("Loading detector weights (first run may download them)...")
         detector.load()
@@ -581,6 +716,7 @@ def _run_command(args: argparse.Namespace) -> int:
                             metadata,
                             calibration_fit,
                         ),
+                        emission_policy=_build_emission_policy(args.behavior_output_interval),
                     )
                 )
             )
@@ -594,11 +730,13 @@ def _run_command(args: argparse.Namespace) -> int:
                 tracking_debug_writer=tracking_debug_writer,
                 behavior_analyzer=behavior_analyzer,
                 behavior_writer=behavior_writer,
+                integrity_guard=integrity_guard,
             )
             result = processor.run(source, sink)
 
     _log_completion(result, analyzer, args.metrics_output)
     _log_behavior_completion(behavior_analyzer, args.behavior_output, result)
+    _log_integrity_completion(integrity_guard, result)
     return EXIT_OK
 
 
@@ -653,6 +791,115 @@ def _log_behavior_completion(
             "(anchor at or beyond the calibration's horizon)",
             analyzer.unprojectable_observations,
         )
+
+
+def _log_integrity_startup(
+    guard: CalibrationIntegrityGuard | None, reference_path: Path | None
+) -> None:
+    if guard is None:
+        logger.info(
+            "Integrity:   not monitored (pass --calibration-reference to detect camera drift)"
+        )
+        return
+    config = guard.monitor.config
+    logger.info("Integrity:   monitored against %s", reference_path)
+    logger.info(
+        "  cadence:   every %.1f s of source time | drift limit %.2f%% of the frame diagonal",
+        config.check_interval_seconds,
+        config.maximum_normalized_drift * 100.0,
+    )
+    logger.info(
+        "  on drift:  %s",
+        "metric observations stop"
+        if guard.mode is IntegrityPolicyMode.GUARDED
+        else "REPORT ONLY — output continues and may be wrong",
+    )
+
+
+def _log_integrity_completion(
+    guard: CalibrationIntegrityGuard | None, result: ProcessingResult
+) -> None:
+    if guard is None:
+        return
+    logger.info("Calibration integrity: final state %s", guard.state.value)
+    if result.behavior_frames_suppressed:
+        logger.warning(
+            "  %d frame(s) of metric observations were withheld after drift was detected. "
+            "Re-calibrate this camera before trusting its metres again.",
+            result.behavior_frames_suppressed,
+        )
+
+
+def _log_integrity_assessment(assessment: IntegrityAssessment) -> None:
+    """Print one assessment, the same way for the run and the standalone command."""
+    logger.info("State:       %s", assessment.state.value)
+    logger.info("Reason:      %s", assessment.reason)
+    metrics = assessment.metrics
+    if metrics is None:
+        return
+    logger.info(
+        "Features:    reference %d, current %d",
+        metrics.reference_keypoints,
+        metrics.current_keypoints,
+    )
+    logger.info(
+        "Matching:    %d candidates, %d inliers (%.0f%%)",
+        metrics.matches,
+        metrics.inliers,
+        metrics.inlier_ratio * 100.0,
+    )
+    if metrics.mean_reprojection_error_px is not None:
+        logger.info("Fit:         mean residual %.2f px", metrics.mean_reprojection_error_px)
+    if metrics.normalized_drift is not None:
+        logger.info(
+            "Drift:       mean %.3f%% of the frame diagonal, worst corner %.3f%%",
+            metrics.normalized_drift * 100.0,
+            (metrics.max_normalized_drift or metrics.normalized_drift) * 100.0,
+        )
+
+
+def _calibration_integrity_command(args: argparse.Namespace) -> int:
+    """Compare one current frame against a calibration's reference frame."""
+    _configure_logging(getattr(args, "verbose", False))
+
+    fit = load_calibration_fit(args.calibration)
+    reference = read_reference_frame(args.reference)
+    current = read_reference_frame(args.current)
+
+    config = CalibrationIntegrityConfig()
+    monitor = CalibrationIntegrityMonitor(
+        reference_frame=reference, config=config, reference_id=str(args.reference)
+    )
+    assessment = monitor.check(current, frame_index=0, timestamp_seconds=0.0)
+
+    reference_height, reference_width = reference.shape[:2]
+    current_height, current_width = current.shape[:2]
+
+    logger.info("Calibration: %s (camera '%s')", args.calibration, fit.camera_id)
+    logger.info("Reference:   %s at %dx%d", args.reference, reference_width, reference_height)
+    logger.info("Current:     %s at %dx%d", args.current, current_width, current_height)
+    _log_integrity_assessment(assessment)
+    logger.info(
+        "Note:        this compares image geometry against the reference. It says whether "
+        "the camera view has moved, not whether the calibration's metres are physically "
+        "correct — only measurement on the floor can establish that."
+    )
+
+    if args.output is not None:
+        evidence = monitor.latest_evidence
+        annotated = render_integrity_overlay(
+            current,
+            reference,
+            assessment,
+            transform=None if evidence is None else evidence.transform,
+        )
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(output_path), annotated):
+            raise ConfigurationError(f"Could not write the integrity diagnostic to {output_path}.")
+        logger.info("Written:     %s", output_path)
+
+    return EXIT_OK
 
 
 def _calibration_validate_command(args: argparse.Namespace) -> int:

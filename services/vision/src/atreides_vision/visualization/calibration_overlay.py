@@ -26,6 +26,7 @@ from typing import Final
 import cv2
 import numpy as np
 
+from atreides_vision.calibration.integrity.models import IntegrityAssessment
 from atreides_vision.calibration.models import VenuePoint
 from atreides_vision.calibration.projector import GroundPlaneProjector
 from atreides_vision.errors import ConfigurationError, ProjectionError
@@ -34,7 +35,11 @@ from atreides_vision.visualization.layout import resolve_overlay_scale
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CalibrationOverlayConfig", "render_calibration_overlay"]
+__all__ = [
+    "CalibrationOverlayConfig",
+    "render_calibration_overlay",
+    "render_integrity_overlay",
+]
 
 _FONT: Final[int] = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -52,6 +57,15 @@ _LABEL_BG: Final[tuple[int, int, int]] = (24, 24, 24)
 #: rather than drawn. Projection near the horizon produces coordinates in the
 #: millions, which OpenCV cannot render and which would be meaningless anyway.
 _MAX_OFFSCREEN_FACTOR: Final[float] = 6.0
+
+#: Colour per integrity state. Muted, and carrying no traffic-light meaning
+#: beyond "these are different findings".
+_STATE_COLORS: Final[dict[str, tuple[int, int, int]]] = {
+    "consistent": (140, 200, 140),
+    "drift_detected": (110, 110, 235),
+    "insufficient_evidence": (150, 190, 210),
+    "unchecked": (170, 170, 170),
+}
 
 #: Ceiling on grid lines per axis, so a mistyped spacing cannot ask for a
 #: million draw calls. Expressed as a count, not a distance, so it holds for a
@@ -339,3 +353,85 @@ def _draw_label(
         thickness,
         cv2.LINE_AA,
     )
+
+
+def render_integrity_overlay(
+    current: np.ndarray,
+    reference: np.ndarray,
+    assessment: IntegrityAssessment,
+    transform: tuple[float, ...] | None = None,
+) -> np.ndarray:
+    """Draw a calibration-integrity finding onto a copy of the current frame.
+
+    Shows where the reference frame's outline lands in the current view under
+    the fitted alignment. If the camera has not moved, that outline hugs the
+    frame edges; if it has, the outline visibly slides, rotates or shrinks away
+    from them, and the size of that gap *is* the drift being reported.
+
+    Diagnostic only. It does not recalibrate anything, and it cannot show
+    whether the calibration's metres were ever correct.
+
+    Args:
+        current: The frame being checked, BGR.
+        reference: The frame it was checked against, used only for its size.
+        assessment: The finding to draw.
+        transform: The fitted reference-to-current mapping, from the monitor's
+            latest evidence. Without it only the summary text is drawn.
+
+    Returns:
+        A new annotated frame. The input is not modified.
+
+    Raises:
+        ConfigurationError: if the current frame is not a usable BGR image.
+    """
+    if current.size == 0 or current.ndim != 3:
+        raise ConfigurationError(
+            f"Integrity diagnostics need a non-empty BGR frame, got shape {current.shape}"
+        )
+
+    canvas = current.copy()
+    height, width = canvas.shape[:2]
+    scale = resolve_overlay_scale(width, height)
+    state = str(assessment.state.value)
+    colour = _STATE_COLORS.get(state, _LABEL_TEXT)
+
+    metrics = assessment.metrics
+    if transform is not None:
+        reference_height, reference_width = reference.shape[:2]
+        corners = [
+            (0.0, 0.0),
+            (float(reference_width), 0.0),
+            (float(reference_width), float(reference_height)),
+            (0.0, float(reference_height)),
+        ]
+        projected: list[tuple[int, int] | None] = []
+        for x, y in corners:
+            w = transform[6] * x + transform[7] * y + transform[8]
+            if abs(w) < 1e-12:
+                projected.append(None)
+                continue
+            projected.append(
+                (
+                    round((transform[0] * x + transform[1] * y + transform[2]) / w),
+                    round((transform[3] * x + transform[4] * y + transform[5]) / w),
+                )
+            )
+        for index, start in enumerate(projected):
+            end = projected[(index + 1) % len(projected)]
+            if start is not None and end is not None:
+                cv2.line(canvas, start, end, colour, scale.box_thickness + 1, cv2.LINE_AA)
+
+    # The frame's own edges, for comparison against the outline above.
+    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), _HULL_COLOR, 1, cv2.LINE_AA)
+
+    lines = [f"integrity: {state}"]
+    if metrics is not None:
+        lines.append(f"inliers {metrics.inliers}/{metrics.matches}")
+        if metrics.normalized_drift is not None:
+            lines.append(f"drift {metrics.normalized_drift * 100:.2f}% of diagonal")
+    padding = scale.padding
+    for row, text in enumerate(lines):
+        anchor = (padding * 2, padding * 3 + row * round(scale.font_scale * 42))
+        _draw_label(canvas, text, anchor, scale.font_scale, padding)
+
+    return canvas

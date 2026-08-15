@@ -1,4 +1,4 @@
-# Atreides — V0.3.2: CALIBRATION PIPELINE (in progress)
+# Atreides — V0.3.3: CALIBRATION INTEGRITY (in progress)
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -25,6 +25,10 @@ deliberately narrow:
   - **V0.3.2 — calibration pipeline.** ✅ Exposes both through the CLI, adds a versioned
     JSONL output contract, and adds calibration validation and visual diagnostics.
     See [docs/vision/V0.3.2_CALIBRATION_PIPELINE.md](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md).
+  - **V0.3.3 — calibration integrity & spatial context.** ✅ Detects when a camera has
+    moved and stops trusting its metres, passes zone labels into behaviour output, and
+    adds output sampling and compression.
+    See [docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -168,6 +172,9 @@ Every run after that is fully offline.
 | `--behavior-output` | off | Write behaviour signals as JSON Lines. Enables behaviour analysis |
 | `--calibration` | off | Ground-plane calibration JSON. Switches signals to metres. Needs `--behavior-output` |
 | `--camera-id` | from config | Camera namespace for behaviour records |
+| `--calibration-reference` | off | Reference frame enabling camera-drift monitoring. Needs `--calibration` |
+| `--integrity-report-only` | off | Keep emitting after drift is detected (diagnostic; output may be wrong) |
+| `--behavior-output-interval` | every frame | Seconds of source time between emitted behaviour snapshots |
 | `--trail-length` | `25` | Centre points kept and drawn per track |
 | `--no-confidence-labels` | off | Draw `ID <n>` without the score |
 | `--log-every` | `100` | Progress log interval, in frames |
@@ -428,7 +435,11 @@ atreides-platform/
 │   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
 │   │   │   │   ├── fitting.py           # solve + measure + safeguard
 │   │   │   │   ├── projector.py         # GroundPlaneProjector (a MotionProjector)
-│   │   │   │   └── loader.py            # JSON loading and validation
+│   │   │   │   ├── loader.py            # JSON loading and validation
+│   │   │   │   └── integrity/            # V0.3.3 camera-drift detection
+│   │   │   │       ├── registration.py       # ORB scene matching — the only OpenCV here
+│   │   │   │       ├── monitor.py            # evidence -> state (measures)
+│   │   │   │       └── policy.py             # guard (decides)
 │   │   │   └── visualization/       # overlay drawing + calibration diagnostics
 │   │   └── tests/
 │   ├── intelligence/            # placeholder
@@ -523,8 +534,8 @@ libraries, web frameworks, Docker.
 ## Current milestone — V0.3: BEHAVIOR SIGNALS
 
 V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
-behaviour signals. **V0.3.0 (the signal foundation) and V0.3.1 (ground-plane
-calibration) are both built.**
+behaviour signals. **V0.3.0 through V0.3.3 are built**: the signal foundation,
+ground-plane calibration, runtime exposure, and calibration-integrity monitoring.
 
 Four neutral measurements per tracked subject per frame: `speed`, `acceleration`,
 `heading_change_rate` and `stationary_duration`. Each carries its subject, timestamp,
@@ -589,10 +600,41 @@ fit numerically (with no GOOD/BAD verdict — no validated threshold exists), an
 `calibration render` draws the venue grid onto a frame, which is the only check that
 can catch a reference point measured against the wrong spot.
 
+### V0.3.3 — calibration integrity & spatial context
+
+A ground-plane calibration is only valid while the camera stays put. Nudge it, rotate
+it, re-zoom or re-crop the stream, and the homography keeps producing confident metre
+values from a premise that is no longer true — and nothing downstream can tell.
+
+`--calibration-reference` enables monitoring against a reference frame captured from
+the calibrated geometry. ORB feature matching (no new dependency, no neural model,
+static scene only — never people) runs every 5 s of source time and reports one of
+four states. On detected drift, **metric observations stop for the rest of the run**
+and the stream records why. Precise-looking metres from a moved camera are worse than
+none.
+
+Drift is measured as **corner displacement relative to the frame diagonal**, never in
+pixels — so one threshold serves a doorway camera and a festival field, and a
+proportional decode resize correctly scores zero.
+
+`CONSISTENT` means only that *the view has not changed*. It is not a claim that the
+calibration's metres were ever correct — a badly measured calibration is perfectly
+consistent, just wrong. And "could not tell" is reported as `INSUFFICIENT_EVIDENCE`,
+never quietly as "unchanged".
+
+Zone membership now reaches behaviour output as neutral `zone_ids` context — opaque
+labels only. Zones remain camera-local image-space polygons; a label attached to a
+metric position does not make it venue geometry.
+
+Behaviour output also gained volume control: `--behavior-output-interval` and gzip via
+a `.jsonl.gz` path. **Analysis is never sampled** — every frame is still analysed in
+full, so signals are unaffected and only serialisation is thinned.
+
 Full detail and the complete limitation lists:
 [V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
 [V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md) ·
-[V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md).
+[V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md) ·
+[V0.3.3](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.

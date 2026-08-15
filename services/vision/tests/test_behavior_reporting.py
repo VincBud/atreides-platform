@@ -98,7 +98,29 @@ def frame(*snapshots: BehaviorSubjectSnapshot) -> BehaviorFrame:
 
 class TestSchemaVersion:
     def test_is_the_milestone_version(self) -> None:
-        assert BEHAVIOR_SCHEMA_VERSION == "0.3.2"
+        assert BEHAVIOR_SCHEMA_VERSION == "0.3.3"
+
+    def test_observation_records_stay_structurally_compatible_with_0_3_2(self) -> None:
+        """The bump announces a new record type, not a changed observation.
+
+        V0.3.3 added ``calibration_integrity`` as a third ``record_type``. A
+        0.3.2 consumer that reads observations keeps working, which is why this
+        pins the observation keys rather than the version alone.
+        """
+        record = observation_records(frame(snapshot(space=METRIC)), metadata(METRIC))[0]
+        required = {
+            "record_type",
+            "schema_version",
+            "camera_id",
+            "frame_index",
+            "timestamp_seconds",
+            "subject",
+            "position",
+            "signals",
+        }
+        assert required <= set(record)
+        assert set(record["position"]) == {"x", "y", "space", "unit"}
+        assert set(record["subject"]) == {"track_id"}
 
     def test_appears_on_every_record(self) -> None:
         """JSONL is read a line at a time; every line must be self-describing."""

@@ -18,6 +18,7 @@ from types import TracebackType
 from typing import Protocol, Self
 
 from atreides_vision.errors import MetricsOutputError
+from atreides_vision.sampling import IntervalSampler
 from atreides_vision.zones.models import ZoneReport
 
 logger = logging.getLogger(__name__)
@@ -33,33 +34,17 @@ class MetricsWriter(Protocol):
     def release(self) -> None: ...
 
 
-class MetricsSampler:
+class MetricsSampler(IntervalSampler):
     """Decides which frames get written, based on source time.
 
     The first frame is always sampled, then one per interval of source time —
     so a 25 FPS and a 60 FPS video of the same scene produce the same number of
     records.
+
+    The scheduling itself is :class:`~atreides_vision.sampling.IntervalSampler`,
+    shared with behaviour-output emission and calibration-integrity checks so
+    all three answer "is it due yet?" identically.
     """
-
-    def __init__(self, interval_seconds: float = 1.0) -> None:
-        if interval_seconds <= 0:
-            raise ValueError(f"interval_seconds must be positive, got {interval_seconds}")
-        self._interval = interval_seconds
-        self._next_due: float | None = None
-
-    @property
-    def interval_seconds(self) -> float:
-        return self._interval
-
-    def should_sample(self, timestamp_seconds: float) -> bool:
-        """Whether the frame at this source timestamp should be recorded."""
-        if self._next_due is None or timestamp_seconds >= self._next_due:
-            self._next_due = timestamp_seconds + self._interval
-            return True
-        return False
-
-    def reset(self) -> None:
-        self._next_due = None
 
 
 class JsonlMetricsWriter:

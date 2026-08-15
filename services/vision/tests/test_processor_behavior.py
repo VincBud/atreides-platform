@@ -19,6 +19,7 @@ from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.config import BehaviorAnalysisConfig
 from atreides_vision.behavior.coordinates import MotionSpace, NormalizedFrameProjector
 from atreides_vision.behavior.models import BehaviorFrame, SignalType, SubjectRef
+from atreides_vision.behavior.reporting import IntegrityFinding
 from atreides_vision.config import PipelineConfig, VisionConfig, VisualizationConfig
 from atreides_vision.models import BoundingBox, Detection
 from atreides_vision.video.processor import VideoProcessor
@@ -70,10 +71,14 @@ class RecordingBehaviorWriter:
 
     def __init__(self) -> None:
         self.frames: list[BehaviorFrame] = []
+        self.integrity: list[IntegrityFinding] = []
         self.released = False
 
     def write_frame(self, frame: BehaviorFrame) -> None:
         self.frames.append(frame)
+
+    def write_integrity(self, assessment: IntegrityFinding) -> None:
+        self.integrity.append(assessment)
 
     def release(self) -> None:
         self.released = True
