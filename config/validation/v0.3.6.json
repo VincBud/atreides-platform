@@ -1,0 +1,34 @@
+{
+  "manifest_version": "0.3.6",
+  "description": "V0.3.6 real-world validation inputs. Each clip is different footage from a different camera, so each carries its own explicit camera_id: nothing in the harness combines counts or identities across them. No clip has a physically measured floor calibration, so every one is processed in normalized image units and no metre, m/s or subjects/m^2 figure is derived for it. A future physically measured scene is added by appending an entry with a 'calibration_path', not by changing validation logic.",
+  "clips": [
+    {
+      "clip_id": "control_baseline_01",
+      "input_path": "data/input/validation/control_baseline_01.mp4",
+      "scene_type": "control",
+      "camera_id": "val_control_01",
+      "notes": "Elevated fixed camera, daylight, moderate occupancy. The reference scene the other three are stated relative to."
+    },
+    {
+      "clip_id": "dense_venue_04",
+      "input_path": "data/input/validation/dense_venue_04.mp4",
+      "scene_type": "dense",
+      "camera_id": "val_dense_04",
+      "notes": "High occupancy with sustained mutual occlusion and a populated far field."
+    },
+    {
+      "clip_id": "low_light_venue_02",
+      "input_path": "data/input/validation/low_light_venue_02.mp4",
+      "scene_type": "low_light",
+      "camera_id": "val_lowlight_02",
+      "notes": "Night scene under strong artificial light, with high contrast between lit and unlit regions."
+    },
+    {
+      "clip_id": "venue_entrance_02",
+      "input_path": "data/input/validation/venue_entrance_02.mp4",
+      "scene_type": "entrance",
+      "camera_id": "val_entrance_02",
+      "notes": "Low-resolution head-on corridor view at 25 FPS. Subjects enter and leave frame frequently, which is the scene type where track births are most confounded with genuine arrivals."
+    }
+  ]
+}

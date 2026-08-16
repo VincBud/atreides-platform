@@ -78,6 +78,18 @@ from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.tracking.bytetrack import ByteTrackTracker
 from atreides_vision.tracking.diagnostics import JsonlTrackingDebugWriter
 from atreides_vision.tracking.ocsort import OcSortTracker
+from atreides_vision.validation.analysis import analyze_clip, analyze_run_directory
+from atreides_vision.validation.ground_truth import GroundTruthStatus
+from atreides_vision.validation.manifest import load_manifest
+from atreides_vision.validation.models import ClipValidationResult
+from atreides_vision.validation.reporting import build_summary, write_validation_artifacts
+from atreides_vision.validation.review_samples import (
+    DEFAULT_CONTINUITY_WINDOW_SECONDS,
+    DEFAULT_CONTINUITY_WINDOWS,
+    DEFAULT_SAMPLE_FRAMES,
+)
+from atreides_vision.validation.runner import ValidationRunner
+from atreides_vision.validation.storage import ValidationLayout
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
 from atreides_vision.video.source import FileVideoSource, VideoMetadata, read_reference_frame
@@ -357,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.set_defaults(handler=_run_command)
     _add_calibration_commands(subparsers)
+    _add_validation_commands(subparsers)
     return parser
 
 
@@ -477,6 +490,240 @@ def _add_calibration_commands(
         help="Optional annotated image showing matched scene features and the drift.",
     )
     integrity_parser.set_defaults(handler=_calibration_integrity_command)
+
+
+def _add_validation_commands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Attach the V0.3.6 ``validation`` commands.
+
+    Two commands rather than one, because the expensive half and the cheap half
+    are done at different times: ``run`` processes footage, ``report`` re-reads
+    what ``run`` already produced. That split is what makes manual annotation
+    practical — filling in the templates and regenerating the report must not
+    require re-processing an hour of video.
+
+    Neither command accepts a detector or tracker threshold. V0.3.6 measures the
+    frozen V0.2.1 defaults, and a harness that accepted overrides would sooner
+    or later be used to tune against its own report.
+    """
+    validation_parser = subparsers.add_parser(
+        "validation",
+        help="Run the V0.3.6 real-world validation harness.",
+        description=(
+            "Measure the V0.3 stack on real footage and report what its own output streams "
+            "say about tracking stability, signal availability, output volume and local "
+            "throughput. Every automated metric is a proxy/system metric, never detection "
+            "recall or an ID-switch rate; those require human annotation, which this harness "
+            "generates templates for and reports separately."
+        ),
+    )
+    validation_sub = validation_parser.add_subparsers(dest="validation_command", required=True)
+
+    run_parser = validation_sub.add_parser(
+        "run",
+        help="Process every clip in a manifest and write the validation artifacts.",
+        description=(
+            "Process each manifest clip with the frozen V0.2.1 defaults, writing an annotated "
+            "video and unsampled behaviour, interaction and crowd streams, then measure them "
+            "and write the summary, CSV and report."
+        ),
+    )
+    _add_validation_common_arguments(run_parser)
+    run_parser.add_argument(
+        "--device",
+        type=Device,
+        choices=list(Device),
+        default=Device.AUTO,
+        help="Compute device: auto, cpu, mps or cuda. Default: auto.",
+    )
+    run_parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Process at most N frames per clip. For a smoke run only — the cap is recorded "
+            "in every result, because a capped run's metrics are not comparable with a full "
+            "one's."
+        ),
+    )
+    run_parser.add_argument(
+        "--sample-frames",
+        type=int,
+        default=DEFAULT_SAMPLE_FRAMES,
+        metavar="N",
+        help=(
+            f"Deterministic still frames sampled per clip for human review. "
+            f"Default: {DEFAULT_SAMPLE_FRAMES}."
+        ),
+    )
+    run_parser.add_argument(
+        "--continuity-windows",
+        type=int,
+        default=DEFAULT_CONTINUITY_WINDOWS,
+        metavar="N",
+        help=(
+            f"Short windows sampled per clip for track-continuity review. "
+            f"Default: {DEFAULT_CONTINUITY_WINDOWS}."
+        ),
+    )
+    run_parser.add_argument(
+        "--continuity-window-seconds",
+        type=float,
+        default=DEFAULT_CONTINUITY_WINDOW_SECONDS,
+        metavar="SECONDS",
+        help=f"Length of each continuity window. Default: {DEFAULT_CONTINUITY_WINDOW_SECONDS:.0f}.",
+    )
+    run_parser.set_defaults(handler=_validation_run_command)
+
+    report_parser = validation_sub.add_parser(
+        "report",
+        help="Regenerate the validation artifacts from an existing run, without re-processing.",
+        description=(
+            "Re-read the output streams an earlier run left on disk, pick up any manual "
+            "annotation that has since been filled in, and regenerate the summary, CSV and "
+            "report. No footage is processed and no metric is recomputed differently — this "
+            "is the same analysis path 'validation run' uses."
+        ),
+    )
+    _add_validation_common_arguments(report_parser)
+    report_parser.set_defaults(handler=_validation_report_command)
+
+
+def _add_validation_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Validation manifest JSON (e.g. config/validation/v0.3.6.json).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Artifact root (e.g. artifacts/v0.3.6-validation). Created if absent.",
+    )
+    parser.add_argument(
+        "--clip",
+        action="append",
+        default=None,
+        metavar="CLIP_ID",
+        help=(
+            "Restrict to one clip. Repeatable. Omit to process every clip in the manifest; "
+            "note that a summary built from a subset describes only that subset."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+
+
+def _validation_run_command(args: argparse.Namespace) -> int:
+    """Process every manifest clip, then measure and report."""
+    _configure_logging(args.verbose)
+
+    manifest = load_manifest(args.manifest).selecting(args.clip or ())
+    layout = ValidationLayout.at(args.output).ensure()
+    device = resolve_device(args.device)
+
+    logger.info("Atreides Vision %s — V0.3.6 validation", __version__)
+    logger.info("Manifest:    %s (%d clip(s))", args.manifest, len(manifest))
+    logger.info("Output:      %s", layout.root)
+    logger.info("Device:      %s", device)
+    logger.info("Profile:     V0.2.1 validated defaults (frozen; not tunable here)")
+    logger.info("Sampling:    none — every analysed frame is written to every stream")
+    if args.max_frames is not None:
+        logger.warning(
+            "Frame cap:   %d per clip. These results are NOT comparable with a full run.",
+            args.max_frames,
+        )
+
+    runner = ValidationRunner(
+        layout=layout,
+        device=device,
+        max_frames=args.max_frames,
+        sample_frames=args.sample_frames,
+        continuity_windows=args.continuity_windows,
+        continuity_window_seconds=args.continuity_window_seconds,
+    )
+    outcomes = runner.run_manifest(manifest)
+
+    logger.info("Measuring output streams...")
+    results = [analyze_clip(layout, outcome) for outcome in outcomes]
+    _finish_validation(layout, results, manifest.source_path)
+    return EXIT_OK
+
+
+def _validation_report_command(args: argparse.Namespace) -> int:
+    """Re-measure existing run artifacts and regenerate every report."""
+    _configure_logging(args.verbose)
+
+    manifest = load_manifest(args.manifest).selecting(args.clip or ())
+    layout = ValidationLayout.at(args.output)
+    if not layout.runs_root.exists():
+        raise ConfigurationError(
+            f"No validation runs found under {layout.runs_root}. Run "
+            f"'atreides-vision validation run --manifest {args.manifest} --output "
+            f"{args.output}' first."
+        )
+
+    logger.info("Atreides Vision %s — V0.3.6 validation report", __version__)
+    logger.info("Manifest:    %s (%d clip(s))", args.manifest, len(manifest))
+    logger.info("Reading:     %s", layout.runs_root)
+
+    results = [analyze_run_directory(layout, clip.clip_id) for clip in manifest]
+    _finish_validation(layout, results, manifest.source_path)
+    return EXIT_OK
+
+
+def _finish_validation(
+    layout: ValidationLayout,
+    results: Sequence[ClipValidationResult],
+    manifest_path: Path | None,
+) -> None:
+    """Write the three artifacts and log what was measured, and what was not."""
+    summary = build_summary(results, None if manifest_path is None else str(manifest_path))
+    written = write_validation_artifacts(layout, summary)
+
+    logger.info("Done.")
+    for result in results:
+        tracks = result.tracks
+        logger.info(
+            "  %-24s %5d unique track id(s) | %.1f births/min | median lifetime %.2f s | "
+            "%.1f processed FPS",
+            result.clip.clip_id,
+            tracks.unique_track_count,
+            tracks.track_births_per_minute or 0.0,
+            tracks.lifetime_seconds.median or 0.0,
+            result.performance.processed_fps or 0.0,
+        )
+    logger.info("Summary:     %s", written["summary_json"])
+    logger.info("CSV:         %s", written["summary_csv"])
+    logger.info("Report:      %s", written["report"])
+
+    unannotated = [
+        result.clip.clip_id
+        for result in results
+        if result.ground_truth.status is GroundTruthStatus.NOT_ANNOTATED
+    ]
+    if unannotated:
+        logger.info(
+            "Ground truth: NOT_ANNOTATED for %s. No detection recall, precision or true "
+            "ID-switch figure is reported for those clips — the automated metrics above are "
+            "proxies and cannot substitute.",
+            ", ".join(unannotated),
+        )
+    if not summary.any_physical_space:
+        logger.info(
+            "Units:       normalized image units throughout. No metre, m/s or subjects/m^2 "
+            "figure was derived; physical validation needs a measured calibration."
+        )
 
 
 def build_tracker(choice: Tracker, config: TrackerConfig) -> MultiObjectTracker:

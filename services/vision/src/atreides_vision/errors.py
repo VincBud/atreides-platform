@@ -94,6 +94,17 @@ class ProjectionError(CalibrationError):
     """
 
 
+class ValidationError(AtreidesVisionError):
+    """Raised when the V0.3.6 validation harness cannot proceed.
+
+    Covers manifests that cannot be trusted (missing clips, duplicate clip or
+    camera ids, malformed JSON), output streams that cannot be read, and manual
+    annotation files that do not parse. Every one of these would otherwise
+    produce a validation report whose numbers describe something other than what
+    the report claims — which is worse than no report at all.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 

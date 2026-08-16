@@ -1,4 +1,4 @@
-# Atreides — V0.3.5: SPATIAL CLUSTER & CROWD DYNAMICS (in progress)
+# Atreides — V0.3.6: REAL-WORLD VALIDATION
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -37,10 +37,24 @@ deliberately narrow:
     across several subjects on one camera: which are spatially connected, how spread
     out, how locally dense, how aligned in motion, and for how long.
     See [docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md).
+  - **V0.3.6 — real-world validation.** ✅ A reproducible harness that measures the
+    whole V0.3 stack on real footage — tracking stability, signal availability, output
+    volume, local throughput. It adds no signal, tunes nothing, and issues **no
+    pass/fail verdict**. Automated system/proxy validation is complete; manual ground
+    truth and physical metric validation are **pending**, and final signal-stack
+    acceptance waits on both.
+    See [docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md](docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
 > unique-ID count is an upper bound, not a census.
+
+> **V0.3.6 measures proxies, not ground truth.** Everything the validation harness
+> derives from Atreides' own output is a *proxy / system metric*. `track_births_per_minute`
+> is **not** an ID-switch rate, a short-track fraction is **not** proof of fragmentation,
+> and nothing automated anywhere is detection recall. True recall and true ID switches
+> require human annotation, which the harness generates templates for and reports in a
+> separate section — or not at all.
 
 ## What it does
 
@@ -147,6 +161,11 @@ uv run atreides-vision run \
   --behavior-output artifacts/behavior.jsonl \
   --camera-id cam_01
 
+# V0.3.6 — real-world validation over a manifest of clips
+uv run atreides-vision validation run \
+  --manifest config/validation/v0.3.6.json \
+  --output artifacts/v0.3.6-validation
+
 # V0.3 — with calibrated venue metres
 uv run atreides-vision run \
   --input data/input/test.mp4 \
@@ -203,6 +222,23 @@ Every run after that is fully offline.
 | `--no-confidence-labels` | off | Draw `ID <n>` without the score |
 | `--log-every` | `100` | Progress log interval, in frames |
 | `--verbose` | off | Debug logging |
+
+#### `validation` options (V0.3.6)
+
+`validation run` and `validation report` share `--manifest`, `--output`, `--clip`
+(repeatable) and `--verbose`. `run` adds:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--device` | `auto` | `auto`, `cpu`, `mps`, or `cuda` |
+| `--max-frames` | all | Per-clip cap for a smoke run. Recorded in every result, because a capped run's metrics are **not** comparable with a full one's |
+| `--sample-frames` | `10` | Deterministic still frames sampled per clip for human review |
+| `--continuity-windows` | `3` | Short windows sampled per clip for track-continuity review |
+| `--continuity-window-seconds` | `8.0` | Length of each continuity window |
+
+**There is no detector or tracker option** — not one that is accepted and ignored,
+there is no parameter to pass. V0.3.6 measures the frozen V0.2.1 defaults, and a
+harness that took overrides would eventually be used to tune against its own report.
 
 `auto` prefers CUDA, then MPS, then CPU. Asking for an accelerator that isn't
 available fails immediately with an explanation instead of an obscure error from
@@ -419,11 +455,21 @@ image space, 1.000× after calibration) and **multi-camera agreement** (two came
 with different geometry and resolution reporting the same speed to 4×10⁻¹⁵ m/s,
 while their observations stay strictly separate).
 
+V0.3.6 adds the validation harness's own tests: every metric checked against synthetic
+structured records with analytic answers, the manifest's identity rules, the manual
+annotation parser (including the cases that must **not** produce a number — zero
+visible people, a false-positive-only frame, a half-filled row), deterministic sample
+points, the runner end-to-end on a synthetic MP4 with fake detector and tracker, the
+run -> report round trip, and the report guarantees themselves: deterministic output,
+proxy and ground truth never sharing a label, no physical unit attached to any value
+for uncalibrated footage, and no pass/fail verdict anywhere.
+
 ## Architecture
 
 ```text
 atreides-platform/
 ├── config/zones.example.json    # zone configuration to copy and edit
+├── config/validation/v0.3.6.json # V0.3.6 validation input manifest
 ├── apps/operator-dashboard/     # placeholder — not this milestone
 ├── packages/contracts/          # placeholder — shared contracts, later
 ├── services/
@@ -467,6 +513,21 @@ atreides-platform/
 │   │   │   │   ├── history.py            # per-composition persistence, bounded
 │   │   │   │   ├── analyzer.py           # the facade VideoProcessor orchestrates
 │   │   │   │   └── reporting.py          # schema 0.3.5 JSONL stream
+│   │   │   ├── validation/          # V0.3.6 real-world validation harness
+│   │   │   │   ├── manifest.py           # which clips, which camera, what kind
+│   │   │   │   ├── storage.py            # artifact layout + deterministic writers
+│   │   │   │   ├── streams.py            # streaming JSONL reader (gzip transparent)
+│   │   │   │   ├── distributions.py      # one percentile implementation, shared
+│   │   │   │   ├── track_metrics.py      # presence, lifetime, churn proxies
+│   │   │   │   ├── behavior_metrics.py   # signal coverage and warm-up
+│   │   │   │   ├── interaction_metrics.py# pair episodes and churn propagation
+│   │   │   │   ├── crowd_metrics.py      # composition episodes and persistence
+│   │   │   │   ├── ground_truth.py       # manual annotation: the ONLY human input
+│   │   │   │   ├── review_samples.py     # deterministic frames + contact sheets
+│   │   │   │   ├── runner.py             # composes the frozen pipeline, times it
+│   │   │   │   ├── analysis.py           # run artifacts -> ClipValidationResult
+│   │   │   │   ├── models.py             # result types and serialised shapes
+│   │   │   │   └── reporting.py          # summary JSON, CSV, Markdown report
 │   │   │   ├── calibration/         # V0.3.1 ground-plane calibration
 │   │   │   │   ├── homography.py        # normalized DLT — pure array maths
 │   │   │   │   ├── models.py            # VenuePoint, correspondences, quality
@@ -718,13 +779,116 @@ depths recover the same arrangement to 1e-4.
 
 There is no crowd risk score, density verdict, surge, crush, panic or unrest signal.
 
+### V0.3.6 — real-world validation & signal-stack freeze
+
+V0.3.0–V0.3.5 were verified against synthetic inputs with known answers, which checks
+that a formula is correct. It does not say what the stack does on real footage. V0.3.6
+answers that, reproducibly, and then freezes the scope.
+
+```bash
+# Process every clip in the manifest, measure, write all three artifacts.
+uv run atreides-vision validation run \
+  --manifest config/validation/v0.3.6.json \
+  --output artifacts/v0.3.6-validation
+
+# Regenerate the artifacts from an existing run — no footage re-processed.
+# This is what picks up manual annotation added since the run.
+uv run atreides-vision validation report \
+  --manifest config/validation/v0.3.6.json \
+  --output artifacts/v0.3.6-validation
+```
+
+It measures, per clip: track lifetime and occupancy, fragmentation and churn proxies,
+observation gaps, behaviour-signal coverage and warm-up, pair-episode stability, how
+often pair episodes end because a **member track ID stopped existing**, cluster
+composition churn and persistence, output volume, and local wall-clock throughput.
+
+**The two measurement classes never mix.** Automated metrics are labelled proxy/system
+metrics everywhere they appear — in the types, the JSON, the `proxy_` CSV prefix and
+the report. Manual ground truth appears only where a human actually annotated, under
+`manual_`, and is **absent entirely** otherwise: an un-annotated clip reports
+`NOT_ANNOTATED` and emits no recall, no precision and no ID-switch figure at all,
+rather than a zero that would be charted next to a real one.
+
+**No physical units for uncalibrated footage.** None of the validation clips has a
+measured floor calibration, so all of them run in normalized image units and no metre,
+m/s or subjects/m² figure is derived. No floor dimension is estimated from doors,
+tiles, vehicles or people. A manifest entry can carry a `calibration_path` for a future
+physically measured scene; none currently does.
+
+**No verdict.** There is no pass, fail, grade or acceptance band anywhere — the evidence
+does not support one. Where scenes differ, the report states a ratio between
+measurements ("2.3× the sub-1 s track fraction"), never a judgement.
+
+**Camera IDs may repeat.** One physical camera supplies many independent clips, so
+`camera_id` is not required to be unique across a manifest; only `clip_id` is. Sharing
+a camera ID asserts that the footage came from the same camera and **nothing more** —
+each clip is processed, written and measured entirely separately, so
+`camera_01/clip_A/track_7` and `camera_01/clip_B/track_7` are two independent
+tracklets. Per-clip counts from clips sharing a camera must not be summed.
+
+The harness is a *consumer* of the runtime: no measurement package imports it, the
+runner composes the same objects `run` does, and it accepts **no** detector or tracker
+option — not one that is ignored, there is no parameter to pass.
+
 Full detail and the complete limitation lists:
 [V0.3.0](docs/vision/V0.3_BEHAVIOR_SIGNALS.md) ·
 [V0.3.1](docs/vision/V0.3.1_GROUND_PLANE_CALIBRATION.md) ·
 [V0.3.2](docs/vision/V0.3.2_CALIBRATION_PIPELINE.md) ·
 [V0.3.3](docs/vision/V0.3.3_CALIBRATION_INTEGRITY_SPATIAL_CONTEXT.md) ·
 [V0.3.4](docs/vision/V0.3.4_INTERACTION_SIGNALS.md) ·
-[V0.3.5](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md).
+[V0.3.5](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md) ·
+[V0.3.6](docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md).
 
 Identity, biometrics, demographics, cross-camera matching, risk scoring and
 behaviour *classification* remain out of scope by design.
+
+### V0.3 validation status
+
+**V0.3.6 does not establish that the V0.3 signal stack is sufficient, accurate against
+reality, or valid in production.** It completes one review of several:
+
+| Stage | Status |
+| --- | --- |
+| Implementation scope (V0.3.0 – V0.3.5 signals) | **complete** |
+| Automated system / proxy validation on real footage | **complete** |
+| Manual detection & tracking ground truth | **pending** |
+| Controlled physical metric validation | **pending** |
+| Production validation | **not established** |
+| Final signal-stack acceptance / freeze | **pending the reviews above** |
+
+**Frozen for the duration of validation** — not to be tuned in response to any
+validation figure, and not to be changed without a new milestone and a re-validation:
+
+| | |
+| --- | --- |
+| Detector | RF-DETR Nano, confidence 0.30 |
+| Tracker | OC-SORT — high-confidence 0.30, minimum IoU 0.30, lost-track buffer 30, minimum consecutive frames 2, direction-consistency weight 0.2, `delta_t` 3 |
+| Deduplication | Rule B3, enabled |
+| Signals | individual, pairwise and crowd sets as built in V0.3.0–V0.3.5 |
+| Schemas | behaviour `0.3.3`, interaction `0.3.4`, crowd `0.3.5` |
+
+Known limitations of the implemented stack:
+
+1. **Camera-local track IDs are tracklets, not guaranteed unique people.** Occlusion
+   fragments identity; when it does, behaviour history, pair history and exact cluster
+   composition all reset.
+2. **No physically validated metric output.** The projection is tested against
+   synthetic cameras with known geometry; no real scene has been validated against
+   measured floor distances.
+3. **Single camera.** No association, no fusion, no venue-local identity, no ReID, no
+   appearance embeddings, no face recognition.
+4. **Measurement only.** No risk engine, no decision engine, no behaviour
+   classification, no operator alerting.
+5. **Detection is the floor for everything.** Missed detections in distant or dense
+   regions propagate into every signal above them.
+
+The validation harness itself is **not** frozen: adding a clip or a metric definition
+cannot change what the pipeline produces.
+
+One open finding, recorded and deliberately not acted on: **median exact-composition
+cluster persistence measured 0.00–0.16 s** on this footage. That is V0.3.5's
+exact-member-set rule behaving as specified — it measures exact composition stability,
+not spatial crowd-region continuity. The V0.3.5 algorithm was **not changed**; whether
+a separate neutral region-continuity primitive is warranted is a bounded review item to
+settle *after* ground-truth review, and nothing has been implemented for it.
