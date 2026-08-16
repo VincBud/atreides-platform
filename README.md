@@ -3,6 +3,15 @@
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
 
+**Two numbering schemes appear in this project and mean different things.** `V1`, `V2`
+and `V3` are *product generations* — what the product is meant to contain. `V0.x` are
+*engineering milestones* — bounded increments of this repository, each with its own
+document and its own validation. This repository is at engineering milestone **V0.3.6**,
+working inside product generation **V1**. A V1 capability that is not implemented here
+yet is unbuilt, not out of scope — and not thereby a V2 capability. See
+[Product roadmap](#product-roadmap--v1-v2-v3) below; `CLAUDE.md` is the authoritative
+architecture document.
+
 **This repository contains the first four technical milestones.** They are
 deliberately narrow:
 
@@ -84,7 +93,8 @@ required — CPU works, Apple Silicon (MPS) is used automatically when available
 
 ## What it intentionally does not do
 
-These are product and privacy boundaries, not missing features:
+These are product and privacy boundaries, not missing features. They hold in **every**
+generation — V1, V2 and V3 alike:
 
 - **It does not identify people.** A track ID is a handle on a box moving through
   one video. It is not a person, a name, or a record.
@@ -95,11 +105,20 @@ These are product and privacy boundaries, not missing features:
   labelled, scored or ranked.
 - **It does not classify demographics.**
 - **It does not make security decisions.** It produces a view for a human operator.
-- **It does not perform cross-camera re-identification.** Track IDs are local to one
-  camera and one session, and mean nothing outside it.
 - **It does not send video to a cloud service.** Raw video stays on your machine.
 - **It does not persist tracks.** There is no database. State lives in memory for the
   duration of a run and is discarded when the process exits.
+- **It does not carry identity beyond a session.** Nothing links a person between runs,
+  between venues, or to a real-world record — in any generation.
+
+**Different thing: what is simply not built yet.** Today every track ID is local to one
+camera and one session and means nothing outside it, so this implementation cannot tell
+that two cameras are watching the same person. That is the state of the V0.3.x
+implementation, not a product boundary — multi-camera association and a *temporary*
+venue-local identity are [V1 capabilities](#product-roadmap--v1-v2-v3). What that
+identity will be when it exists: session-scoped, confidence-aware, held in memory,
+discarded when the process exits, and used to avoid counting one person twice at venue
+level. What it will never be: a name, a stored record, a face, or any biometric template.
 
 Zone analytics operate only on anonymous tracking geometry: boxes, positions and
 elapsed time. The metrics stream contains zone counts and durations, never track
@@ -110,6 +129,65 @@ these milestones. **`motion_level` is not a risk score** — see below.
 
 > The one network call in the whole project is the first-run download of the RF-DETR
 > model weights. Your video is never uploaded.
+
+## Product roadmap — V1, V2, V3
+
+One product family, one core. Generations differ by capability and deployment profile,
+not by forking the pipeline. `CLAUDE.md` holds the full architecture.
+
+### V1 — CCTV multi-camera decision support
+
+V1 runs on a venue's **existing** CCTV. It is multi-camera by definition, and its
+required capabilities are:
+
+| V1 capability | In this repository today |
+| --- | --- |
+| Multi-camera ingestion | one video per run; the validation harness processes many clips, each independently |
+| Camera-local detection and tracking | ✅ V0.1, chosen and justified by measurement in V0.2.1 |
+| Calibration and spatial context | ✅ V0.3.1 – V0.3.3, validated against synthetic geometry only |
+| Behaviour, interaction and crowd signals | ✅ V0.3.0, V0.3.4, V0.3.5 |
+| **Multi-camera association / fusion** | not implemented |
+| **Temporary venue-local identity** | not implemented |
+| Evidence aggregation over time | partial — bounded per-subject, per-pair and per-cluster history, within one camera and one run |
+| Risk / decision engine foundation | not implemented |
+| Decision-support events | not implemented |
+| Validation and observability for pilots | in progress — V0.3.6 |
+
+**Multi-camera association is a V1 capability**, not a V2 one. It is not implemented in
+this repository yet, and the milestone sections below say so wherever it is relevant.
+Its job is to decide when camera-local tracklets are the same real person right now —
+so that one person walking past three cameras is not counted three times — and to
+produce a temporary venue-local identity above the trackers, never inside them:
+
+```text
+camera_01 / track_17 ─┐
+                      ├── venue_person_0042   (temporary, session-scoped, confidence-aware)
+camera_02 / track_08 ─┘
+```
+
+Where the evidence is insufficient, the intended answer is *no merge* or *ambiguous* —
+a missed association is recoverable, a wrong one silently corrupts every venue-level
+number above it. Association also never destroys provenance: a venue-local subject
+always resolves back to the `(camera, track)` observations that produced it.
+
+### V2 — extreme vision and advanced association
+
+V2 **strengthens V1**; it does not introduce association from scratch. Its areas:
+extreme low-light robustness, strobe and rapidly changing lighting, stronger
+motion-blur handling, severe occlusion, improved tracking continuity, stronger ReID,
+long-gap association, difficult non-overlapping camera transitions, advanced
+multi-camera fusion, and first-class confidence and observability.
+
+"ReID" here means appearance-based matching methods that make association work in hard
+conditions. It does not mean persistent or biometric identity, which is excluded in
+every generation.
+
+### V3 — Atreides certified deployment
+
+V3 is where Atreides stops inheriting whatever cameras a venue already has: specified
+RGB/NIR sensors, controlled optics, defined camera topology and overlap, standardised
+installation, calibration procedures, deployment validation, and certified deployments.
+None of it is built during V1, and nothing in this repository assumes it.
 
 ## Setup
 
@@ -673,9 +751,15 @@ walk to within `4×10⁻¹⁵ m/s`.
 
 **Spatial agreement is not identity.** Two cameras placing someone at the same
 coordinates are two independent observations — `(cam_a, 7)` and `(cam_b, 7)` remain
-two distinct subjects, and nothing associates them. A camera-local track ID is still
-not a unique venue person: that is limitation (2) from the V0.2.1 report, unfixed
-and not pretended otherwise.
+two distinct subjects, and nothing in this implementation associates them. A
+camera-local track ID is still not a unique venue person: that is limitation (2) from
+the V0.2.1 report, unfixed and not pretended otherwise.
+
+Shared venue coordinates are what a future association layer will reason over, but they
+are not a substitute for it. Multi-camera association is a V1 capability that this
+milestone does not implement; when it does arrive it sits **above** tracking and
+calibration as its own layer, producing a temporary venue-local identity. It will not
+change what a camera-local track ID means — a tracklet stays a tracklet.
 
 One homography describes **one plane**. Stairs, balconies, platforms and multiple
 floors are not supported. No calibration has been validated against a real measured
@@ -745,9 +829,12 @@ depending on their depth in the frame, while calibration recovers `2.0000 m` at 
 
 **Pairs are same-camera only, and that is deliberate.** `cam_A/track_7` is never
 paired with `cam_B/track_12` even when both project to nearly the same venue
-coordinates: without multi-camera association, one real person seen by two cameras
-would be paired *with themselves*. Cross-camera pairing is rejected at construction,
-not merely absent.
+coordinates: with no association layer to say whether those are two people or one, a
+single person seen by two cameras would be paired *with themselves*. Cross-camera
+pairing is rejected at construction, not merely absent. That guard is correct for as
+long as association is unimplemented — and it stays correct afterwards, because
+cross-camera pairing only becomes meaningful through venue-local identity, one layer up,
+never by relaxing this rule.
 
 Everything is a measurement. There is no confrontation, aggression, threat, conflict
 or escalation signal — those need evidence Atreides does not have, and a layer that
@@ -840,8 +927,11 @@ Full detail and the complete limitation lists:
 [V0.3.5](docs/vision/V0.3.5_SPATIAL_CLUSTER_CROWD_DYNAMICS.md) ·
 [V0.3.6](docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md).
 
-Identity, biometrics, demographics, cross-camera matching, risk scoring and
-behaviour *classification* remain out of scope by design.
+Persistent identity, biometrics, demographics and behaviour *classification* remain out
+of scope by design, in every generation. Cross-camera association, temporary venue-local
+identity, evidence aggregation and the risk / decision-support layer are a different
+case: they are V1 product capabilities that these milestones do not implement — out of
+scope *for V0.3*, not out of scope for the product.
 
 ### V0.3 validation status
 
@@ -876,10 +966,14 @@ Known limitations of the implemented stack:
 2. **No physically validated metric output.** The projection is tested against
    synthetic cameras with known geometry; no real scene has been validated against
    measured floor distances.
-3. **Single camera.** No association, no fusion, no venue-local identity, no ReID, no
-   appearance embeddings, no face recognition.
+3. **Camera-local only.** Each camera is processed independently: no multi-camera
+   association, no fusion, no venue-local identity, no appearance embeddings. Association
+   and *temporary* venue-local identity are V1 capabilities that are not yet built;
+   stronger ReID and long-gap association are V2 improvements on top of them. Face
+   recognition and persistent identity are excluded permanently, not pending.
 4. **Measurement only.** No risk engine, no decision engine, no behaviour
-   classification, no operator alerting.
+   classification, no operator alerting. The risk / decision-support foundation is V1
+   work that has not started.
 5. **Detection is the floor for everything.** Missed detections in distant or dense
    regions propagate into every signal above them.
 
