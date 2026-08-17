@@ -1,4 +1,4 @@
-# Atreides — V0.3.6: REAL-WORLD VALIDATION
+# Atreides — V0.4.0: MULTI-CAMERA TIME & VENUE INGESTION FOUNDATION
 
 Atreides is an AI-assisted venue security intelligence platform. It analyses existing
 CCTV/video streams and gives human security operators situational awareness.
@@ -6,13 +6,13 @@ CCTV/video streams and gives human security operators situational awareness.
 **Two numbering schemes appear in this project and mean different things.** `V1`, `V2`
 and `V3` are *product generations* — what the product is meant to contain. `V0.x` are
 *engineering milestones* — bounded increments of this repository, each with its own
-document and its own validation. This repository is at engineering milestone **V0.3.6**,
+document and its own validation. This repository is at engineering milestone **V0.4.0**,
 working inside product generation **V1**. A V1 capability that is not implemented here
 yet is unbuilt, not out of scope — and not thereby a V2 capability. See
 [Product roadmap](#product-roadmap--v1-v2-v3) below; `CLAUDE.md` is the authoritative
 architecture document.
 
-**This repository contains the first four technical milestones.** They are
+**This repository contains the first five technical milestones.** They are
 deliberately narrow:
 
 - **V0.1 — SEE + TRACK.** ✅ Find people in a video and follow them frame to frame.
@@ -53,6 +53,13 @@ deliberately narrow:
     truth and physical metric validation are **pending**, and final signal-stack
     acceptance waits on both.
     See [docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md](docs/vision/V0.3.6_REAL_WORLD_VALIDATION.md).
+- **V0.4.0 — MULTI-CAMERA TIME & VENUE INGESTION FOUNDATION.** ✅ Describes N camera
+  streams as one venue session, places every frame on one session-relative **venue
+  timeline** with its **uncertainty stated**, distinguishes a camera's recordings across a
+  restart, and hands a later layer a deterministically ordered, fully provenanced stream of
+  observations. It coordinates **time and provenance only** — it does **not** compare people,
+  and adds no association, no venue-local identity and no appearance information.
+  See [docs/vision/V0.4.0_MULTI_CAMERA_TIME_VENUE_INGESTION.md](docs/vision/V0.4.0_MULTI_CAMERA_TIME_VENUE_INGESTION.md).
 
 > **Read the V0.2.1 limitations before trusting any count.** In particular, a
 > unique track ID is *not* a unique person: same-person ID multiplicity means the
@@ -142,7 +149,7 @@ required capabilities are:
 
 | V1 capability | In this repository today |
 | --- | --- |
-| Multi-camera ingestion | one video per run; the validation harness processes many clips, each independently |
+| Multi-camera ingestion | ✅ foundation — V0.4.0: N streams in one venue session, one venue timeline, deterministic fan-in. Per-camera signal wiring is not built |
 | Camera-local detection and tracking | ✅ V0.1, chosen and justified by measurement in V0.2.1 |
 | Calibration and spatial context | ✅ V0.3.1 – V0.3.3, validated against synthetic geometry only |
 | Behaviour, interaction and crowd signals | ✅ V0.3.0, V0.3.4, V0.3.5 |
@@ -548,6 +555,7 @@ for uncalibrated footage, and no pass/fail verdict anywhere.
 atreides-platform/
 ├── config/zones.example.json    # zone configuration to copy and edit
 ├── config/validation/v0.3.6.json # V0.3.6 validation input manifest
+├── config/venue/example.json    # V0.4.0 venue session manifest example
 ├── apps/operator-dashboard/     # placeholder — not this milestone
 ├── packages/contracts/          # placeholder — shared contracts, later
 ├── services/
@@ -616,6 +624,14 @@ atreides-platform/
 │   │   │   │       ├── registration.py       # ORB scene matching — the only OpenCV here
 │   │   │   │       ├── monitor.py            # evidence -> state (measures)
 │   │   │   │       └── policy.py             # guard (decides)
+│   │   │   ├── timing.py            # V0.4.0 StreamRef, StreamFrame, TimeUncertainty
+│   │   │   ├── venue/               # V0.4.0 multi-camera time & ingestion
+│   │   │   │   ├── models.py             # StreamActivity, StreamAbsence, VenueTick
+│   │   │   │   ├── manifest.py           # venue session manifest (schema 0.4.0)
+│   │   │   │   ├── timebase.py           # source time -> venue time, with uncertainty
+│   │   │   │   ├── scheduler.py          # StreamCursor + the deterministic merge rule
+│   │   │   │   ├── session.py            # VenueSession facade, VideoSourceCursor
+│   │   │   │   └── reporting.py          # schema 0.4.0 session record stream
 │   │   │   └── visualization/       # overlay drawing + calibration diagnostics
 │   │   └── tests/
 │   ├── intelligence/            # placeholder
@@ -707,7 +723,7 @@ point-in-polygon is ours.
 Dev: `pytest`, `ruff`, `mypy`. Deliberately absent: Ultralytics, cloud SDKs, database
 libraries, web frameworks, Docker.
 
-## Current milestone — V0.3: BEHAVIOR SIGNALS
+## Previous milestone — V0.3: BEHAVIOR SIGNALS
 
 V0.2.1 closed the question of *which* configuration to run. V0.3 turns tracks into
 behaviour signals. **V0.3.0 through V0.3.5 are built**: the signal foundation,
@@ -986,3 +1002,81 @@ exact-member-set rule behaving as specified — it measures exact composition st
 not spatial crowd-region continuity. The V0.3.5 algorithm was **not changed**; whether
 a separate neutral region-continuity primitive is warranted is a bounded review item to
 settle *after* ground-truth review, and nothing has been implemented for it.
+
+## Current milestone — V0.4.0: MULTI-CAMERA TIME & VENUE INGESTION FOUNDATION
+
+Every milestone up to V0.3.6 processed **one video per run**. V0.4.0 builds the foundation
+underneath multi-camera operation — and nothing above it.
+
+It coordinates **time and provenance only.** It does not compare people. There is no
+association, no venue-local identity, no cross-camera matching and no appearance
+information anywhere in this layer.
+
+```text
+camera-local processing
+  → venue-time alignment / multi-camera fan-in     ← V0.4.0 builds this
+  → future association
+  → future temporary venue-local identity
+  → future venue-level evidence
+  → future Risk / Decision Support
+```
+
+### What it adds
+
+- **A venue session.** N camera streams described by one manifest, with unique camera ids.
+  One camera is the degenerate case of the same path — there is no separate single-camera
+  mode and no `if multi_camera:` branch.
+- **A venue timeline.** Every frame carries both `source_seconds` (where it sits in *that
+  file*) and `venue_seconds` (the same instant on one session-relative timeline). Venue time
+  is session-relative: no wall clock, no date, no NTP, and no absolute timestamp invented
+  from file metadata.
+- **Explicit timing uncertainty.** `TimeUncertainty` is `NOT_ESTABLISHED` by default and
+  **rejects a zero half-width at construction** — along with negatives, NaN and infinity.
+  Declaring an offset without an accuracy is a manifest error, not a silent zero. There is
+  no threshold, no comparison operator and no `is_aligned_enough()`.
+- **Frame-rate provenance.** A container that reports a bogus frame rate used to be papered
+  over with a 25 FPS fallback that nothing downstream could detect. `FrameRateSource`
+  (`CONTAINER` / `ASSUMED` / `DECLARED`) now records which it was, and an `ASSUMED` rate is
+  forbidden from carrying a declared alignment — a fixed half-width cannot describe an error
+  that grows linearly with elapsed time.
+- **Stream epochs.** `StreamRef(camera_id, stream_epoch)` distinguishes `cam_north` before a
+  restart from `cam_north` after one. The epoch is the source's index in that camera's
+  manifest list — no clock, no UUID, no hash — so recorded sessions are reproducible.
+  Crossing an epoch boundary **breaks track identity**: `(cam_north, track_7)` on either
+  side are unrelated tracklets.
+- **Deterministic N-source fan-in.** Ticks are driven by source events, not a fixed venue
+  cadence, so unequal frame rates need no resampling and no frame is ever synthesised.
+  Ordering is total on `(venue_micros, camera_id, stream_epoch, frame_index)` with an
+  **integer** microsecond key — no tolerance constant anywhere. Manifest order cannot reach
+  the output.
+- **Not-contributing as a first-class value.** `BETWEEN_FRAMES`, `NOT_YET_STARTED` and
+  `ENDED` are distinct facts: "we did not look" is never rendered as "we looked and saw
+  nobody".
+- **`venue inspect`** — one narrow diagnostic CLI command that walks a session's tick
+  schedule and writes a versioned record. It runs no detector and no tracker, so it needs no
+  weights, no network and no GPU.
+
+`SubjectRef` is unchanged at `(camera_id, track_id)`. No frozen V0.3.x schema changed.
+Existing commands and the V0.3.6 validation harness behave exactly as before.
+
+### What it does not do
+
+No Multi-Camera Association or Fusion · no `VenueSubjectId` or temporary venue-local
+identity · no cross-camera ReID, appearance embeddings or face recognition · no hand-off
+matching · no duplicate-count suppression or venue headcount · no same-camera fragment
+stitching · no venue-level crowd/interaction fusion · no Risk / Decision Engine · no
+per-camera signal wiring in a venue session · no live/RTSP deployment · no absolute
+wall-clock venue time · no cumulative unique visitors · no V2 extreme vision · no V3
+hardware · **no production-readiness claim.**
+
+**No real-world multi-camera validation exists.** Determinism, heterogeneous frame rates,
+offsets, restarts and bounded state are proven on synthetic sources and on synthetic
+manifests over real containers. Synthetic correctness is not real-world robustness, and no
+genuinely simultaneous multi-camera footage exists in this repository to test against.
+
+Alignment is only ever as good as the operator's declaration: Atreides does not measure the
+offset between two streams and cannot detect a wrong one. Deriving offsets by
+cross-correlating stream content would be association by another name, and is out of scope.
+
+See [docs/vision/V0.4.0_MULTI_CAMERA_TIME_VENUE_INGESTION.md](docs/vision/V0.4.0_MULTI_CAMERA_TIME_VENUE_INGESTION.md)
+for the full design, the association seam and the complete limitations.

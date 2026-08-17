@@ -1,0 +1,32 @@
+{
+  "manifest_version": "0.4.0",
+  "session_id": "example_session",
+  "description": "Example V0.4.0 venue session. Three streams from two cameras, deliberately heterogeneous: different frame rates, different start times and different durations, because a real venue's existing CCTV is never uniform. Nothing here describes a layout, an overlap or a coverage area — Atreides never assumes camera geometry, and non-overlapping cameras are an ordinary case. 'cam_north' stopped and restarted during the session, so it has two sources; their position in the list is the stream epoch, and crossing that boundary breaks track identity: (cam_north, track_7) before and after are unrelated tracklets. A camera with several sources must declare where each one starts, and a declared 'start_offset_seconds' always carries an 'offset_accuracy_seconds' — an offset with no stated accuracy would be read as exact, which no manually declared offset is. 'cam_west' declares neither, which is fully supported: it starts at venue zero with its alignment NOT_ESTABLISHED. 'declared_fps' overrides a container that reports a frame rate it does not have; every source-relative timestamp is derived from that number, so it is recorded as an operator statement rather than passed off as the container's own. The paths below are examples: data/input/ is git-ignored and nothing is downloaded.",
+  "cameras": [
+    {
+      "camera_id": "cam_north",
+      "sources": [
+        {
+          "input_path": "data/input/venue/cam_north_part1.mp4",
+          "start_offset_seconds": 0.0,
+          "offset_accuracy_seconds": 0.5,
+          "declared_fps": 25.0
+        },
+        {
+          "input_path": "data/input/venue/cam_north_part2.mp4",
+          "start_offset_seconds": 612.5,
+          "offset_accuracy_seconds": 0.5,
+          "declared_fps": 25.0
+        }
+      ]
+    },
+    {
+      "camera_id": "cam_west",
+      "sources": [
+        {
+          "input_path": "data/input/venue/cam_west.mp4"
+        }
+      ]
+    }
+  ]
+}

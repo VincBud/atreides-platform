@@ -105,6 +105,22 @@ class ValidationError(AtreidesVisionError):
     """
 
 
+class VenueSessionError(AtreidesVisionError):
+    """Raised when a multi-camera venue session cannot be described or walked.
+
+    Covers venue manifests that cannot be trusted (unknown version, duplicate
+    camera ids, an offset declared without an accuracy), time bases that would
+    have to invent a number (a declared offset on a stream whose frame rate was
+    only assumed), stream references and frames that violate their invariants,
+    and the venue session output stream failing to open or write.
+
+    Every one of these would otherwise put a confident time on a frame that is
+    not where it claims to be on the venue timeline. Since venue time is what
+    orders observations from different cameras, a wrong second here is worse
+    than a stopped run.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 

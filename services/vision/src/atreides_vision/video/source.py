@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from atreides_vision.errors import VideoSourceError
+from atreides_vision.timing import FrameRateSource
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,11 @@ class VideoMetadata:
     fps: float
     #: Total frames if the container reports a usable value, else ``None``.
     frame_count: int | None
+    #: Where :attr:`fps` came from. Every source-relative timestamp is derived
+    #: from that number, so a fallback constant and a real container value must
+    #: not look alike downstream. Defaults to ``CONTAINER`` so existing callers
+    #: constructing metadata directly are unaffected.
+    fps_source: FrameRateSource = FrameRateSource.CONTAINER
 
     @property
     def resolution(self) -> str:
@@ -106,13 +112,27 @@ class FileVideoSource:
             for frame in source.frames():
                 ...
 
+    ``declared_fps`` overrides whatever the container reports. Real CCTV exports
+    routinely carry a nonsensical or plainly wrong frame rate, and every
+    source-relative timestamp is derived from that number; letting an operator
+    state the true rate is the only honest remedy, and it is recorded as
+    :attr:`~atreides_vision.timing.FrameRateSource.DECLARED` rather than being
+    passed off as the container's own value.
+
     Raises:
-        VideoSourceError: if the path does not exist, is not a file, or cannot
-            be decoded. The failure is always explicit — never a silent
-            zero-frame run.
+        VideoSourceError: if the path does not exist, is not a file, cannot be
+            decoded, or ``declared_fps`` is not a positive finite number. The
+            failure is always explicit — never a silent zero-frame run.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, declared_fps: float | None = None) -> None:
+        if declared_fps is not None and (not np.isfinite(declared_fps) or declared_fps <= 0):
+            raise VideoSourceError(
+                f"declared_fps must be a positive, finite frame rate, got {declared_fps!r}. "
+                "Omit it to use the rate the container reports."
+            )
+        self._declared_fps = declared_fps
+
         self._path = Path(path)
         if not self._path.exists():
             raise VideoSourceError(
@@ -144,20 +164,39 @@ class FileVideoSource:
         height = int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         raw_fps = float(self._capture.get(cv2.CAP_PROP_FPS))
-        if not np.isfinite(raw_fps) or raw_fps <= 0:
+        if self._declared_fps is not None:
+            logger.info(
+                "Using the declared frame rate %.4f FPS for %s; the container reported %r.",
+                self._declared_fps,
+                self._path,
+                raw_fps,
+            )
+            fps = self._declared_fps
+            fps_source = FrameRateSource.DECLARED
+        elif not np.isfinite(raw_fps) or raw_fps <= 0:
             logger.warning(
-                "Video reports an unusable frame rate (%r); assuming %.1f FPS for output timing.",
+                "Video reports an unusable frame rate (%r); assuming %.1f FPS for output timing. "
+                "Timestamps derived from an assumed rate drift by an unknown, growing amount — "
+                "declare the real rate for this source if it matters.",
                 raw_fps,
                 DEFAULT_FALLBACK_FPS,
             )
             fps = DEFAULT_FALLBACK_FPS
+            fps_source = FrameRateSource.ASSUMED
         else:
             fps = raw_fps
+            fps_source = FrameRateSource.CONTAINER
 
         raw_count = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_count = raw_count if raw_count > 0 else None
 
-        return VideoMetadata(width=width, height=height, fps=fps, frame_count=frame_count)
+        return VideoMetadata(
+            width=width,
+            height=height,
+            fps=fps,
+            frame_count=frame_count,
+            fps_source=fps_source,
+        )
 
     @property
     def path(self) -> Path:

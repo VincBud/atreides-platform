@@ -74,6 +74,7 @@ from atreides_vision.interaction.reporting import (
     InteractionRunMetadata,
     JsonlInteractionWriter,
 )
+from atreides_vision.timing import StreamRef
 from atreides_vision.tracking.base import MultiObjectTracker
 from atreides_vision.tracking.bytetrack import ByteTrackTracker
 from atreides_vision.tracking.diagnostics import JsonlTrackingDebugWriter
@@ -90,6 +91,16 @@ from atreides_vision.validation.review_samples import (
 )
 from atreides_vision.validation.runner import ValidationRunner
 from atreides_vision.validation.storage import ValidationLayout
+from atreides_vision.venue.manifest import load_venue_manifest
+from atreides_vision.venue.models import stream_sort_key
+from atreides_vision.venue.reporting import (
+    JsonlVenueSessionWriter,
+    VenueSessionMetadata,
+    VenueSessionSummary,
+    VenueStreamProvenance,
+)
+from atreides_vision.venue.session import VenueSession, VideoSourceCursor
+from atreides_vision.venue.timebase import VenueTimebase
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
 from atreides_vision.video.source import FileVideoSource, VideoMetadata, read_reference_frame
@@ -370,6 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(handler=_run_command)
     _add_calibration_commands(subparsers)
     _add_validation_commands(subparsers)
+    _add_venue_commands(subparsers)
     return parser
 
 
@@ -621,6 +633,191 @@ def _add_validation_common_arguments(parser: argparse.ArgumentParser) -> None:
         "-v",
         action="store_true",
         help="Enable debug logging.",
+    )
+
+
+def _add_venue_commands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Attach the V0.4.0 ``venue`` command.
+
+    One subcommand, and a diagnostic one. ``inspect`` answers the question an
+    operator actually has before a multi-camera deployment is trusted: given
+    this manifest, what does the system believe about each camera's frame rate,
+    each recording's place on the venue timeline, and how the streams interleave?
+
+    It runs **no detector and no tracker**. Ingestion is what this milestone
+    built, and a command that also processed video would make the ingestion
+    behaviour impossible to see and impossible to test without model weights.
+    """
+    venue_parser = subparsers.add_parser(
+        "venue",
+        help="Inspect a multi-camera venue session.",
+        description=(
+            "Read a venue session manifest, open every recording, and walk the merged tick "
+            "schedule the cameras produce. Reports timing and ordering only — no detection, "
+            "no tracking, no association, and no venue-local identity of any kind."
+        ),
+    )
+    venue_sub = venue_parser.add_subparsers(dest="venue_command", required=True)
+
+    inspect_parser = venue_sub.add_parser(
+        "inspect",
+        help="Walk a venue session's tick schedule and write the session record.",
+        description=(
+            "Open each camera's recordings, place them on one session-relative timeline, and "
+            "write the versioned JSONL session record: which streams exist, how their frame "
+            "rates were established, how well they are aligned, and which streams contributed "
+            "at each venue instant. Cameras contributing to the same tick were recording at "
+            "the same instant; nothing here says they saw the same person."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Venue session manifest JSON (e.g. config/venue/example.json).",
+    )
+    inspect_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help=(
+            "Session record destination as JSON Lines "
+            "(e.g. artifacts/venue_session.jsonl). A .gz suffix compresses it."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+    inspect_parser.set_defaults(handler=_venue_inspect_command)
+
+
+def _venue_inspect_command(args: argparse.Namespace) -> int:
+    """Walk a venue session's tick schedule and write its session record."""
+    _configure_logging(args.verbose)
+
+    manifest = load_venue_manifest(args.manifest)
+    logger.info("Atreides Vision %s — V0.4.0 venue session inspection", __version__)
+    logger.info("Manifest:    %s", args.manifest)
+    logger.info(
+        "Session:     '%s' — %d camera(s), %d stream(s)",
+        manifest.session_id,
+        len(manifest),
+        manifest.stream_count,
+    )
+
+    timebase = VenueTimebase()
+    with ExitStack() as stack:
+        cursors: list[VideoSourceCursor] = []
+        provenance: list[VenueStreamProvenance] = []
+
+        for camera in manifest:
+            for epoch, entry in enumerate(camera.sources):
+                # The epoch is the source's position in this camera's list, and
+                # nothing else. It is session-scoped, never persisted, and never
+                # part of a subject reference.
+                stream = StreamRef(camera_id=camera.camera_id, stream_epoch=epoch)
+                source = stack.enter_context(
+                    FileVideoSource(entry.input_path, declared_fps=entry.declared_fps)
+                )
+                metadata = source.metadata
+                timebase.register(
+                    stream,
+                    fps_source=metadata.fps_source,
+                    offset_seconds=entry.start_offset_seconds,
+                    offset_accuracy_seconds=entry.offset_accuracy_seconds,
+                )
+                cursors.append(VideoSourceCursor(stream, source, timebase))
+                provenance.append(
+                    VenueStreamProvenance(
+                        stream=stream,
+                        input_path=str(entry.input_path),
+                        width=metadata.width,
+                        height=metadata.height,
+                        fps=metadata.fps,
+                        fps_source=metadata.fps_source,
+                        offset_seconds=timebase.offset_seconds(stream),
+                        timing=timebase.uncertainty(stream),
+                        frame_count=metadata.frame_count,
+                    )
+                )
+
+        session = VenueSession(manifest.session_id, timebase, cursors)
+        _log_venue_streams(provenance)
+
+        writer = stack.enter_context(
+            JsonlVenueSessionWriter(
+                args.output,
+                VenueSessionMetadata(
+                    session_id=session.session_id,
+                    # Canonical order, so the manifest's camera order cannot
+                    # reach the file.
+                    streams=tuple(
+                        sorted(provenance, key=lambda entry: stream_sort_key(entry.stream))
+                    ),
+                    manifest_path=str(args.manifest),
+                ),
+            )
+        )
+        for tick in session.ticks():
+            writer.write_tick(tick)
+        writer.write_summary(
+            VenueSessionSummary(
+                session_id=session.session_id,
+                tick_count=session.tick_count,
+                frames_by_stream=session.frames_by_stream,
+                first_venue_micros=session.first_venue_micros,
+                last_venue_micros=session.last_venue_micros,
+            )
+        )
+
+    _log_venue_completion(session, args.output)
+    return EXIT_OK
+
+
+def _log_venue_streams(provenance: Sequence[VenueStreamProvenance]) -> None:
+    """State plainly what is believed about each stream before walking it."""
+    for entry in sorted(provenance, key=lambda item: stream_sort_key(item.stream)):
+        logger.info(
+            "  %-16s %s @ %.3f FPS (%s) | starts at %.3f s | alignment %s",
+            str(entry.stream),
+            entry.input_path,
+            entry.fps,
+            entry.fps_source.value,
+            entry.offset_seconds,
+            entry.timing.basis.value
+            if entry.timing.half_width_seconds is None
+            else f"{entry.timing.basis.value} +/- {entry.timing.half_width_seconds:.3f} s",
+        )
+
+
+def _log_venue_completion(session: VenueSession, output_path: Path) -> None:
+    logger.info("Done.")
+    logger.info("Ticks:               %d", session.tick_count)
+    for stream, frames in session.frames_by_stream:
+        logger.info("  %-16s %d frame(s) contributed", str(stream), frames)
+    if session.first_venue_micros is not None and session.last_venue_micros is not None:
+        logger.info(
+            "Venue span:          %.3f s (session-relative; no wall-clock time is used)",
+            (session.last_venue_micros - session.first_venue_micros) / 1_000_000,
+        )
+    logger.info("Session record:      %s", output_path)
+    if not session.alignment.is_established:
+        logger.info(
+            "Alignment:   NOT_ESTABLISHED for at least one stream. Streams are ordered against "
+            "each other by construction, not by evidence — declare start offsets and their "
+            "accuracy in the manifest to establish it."
+        )
+    logger.info(
+        "Note:        ingestion only. No detection, no tracking, no cross-camera association "
+        "and no venue-local identity: two cameras in one tick were recording at the same "
+        "instant, which says nothing about whether they saw the same person."
     )
 
 
