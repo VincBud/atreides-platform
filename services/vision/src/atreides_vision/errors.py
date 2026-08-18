@@ -155,6 +155,20 @@ class IdentityError(AtreidesVisionError):
     """
 
 
+class FusionError(AtreidesVisionError):
+    """Raised when association-to-venue-identity integration is asked for the impossible.
+
+    Covers an outcome record built without the explanation it requires. This
+    layer coordinates :mod:`atreides_vision.association` and
+    :mod:`atreides_vision.identity` without absorbing either's own failure
+    modes: a decision that fails association's own invariants raises
+    :class:`AssociationError`, and a registry operation this layer performs
+    that violates identity's own invariants raises :class:`IdentityError`
+    unchanged. This class exists only for the integration layer's own
+    reporting contract.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 
