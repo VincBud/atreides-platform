@@ -137,6 +137,24 @@ class VenueSessionError(AtreidesVisionError):
     """
 
 
+class IdentityError(AtreidesVisionError):
+    """Raised when venue-local identity is asked for the impossible.
+
+    Covers memberships that contradict their own provenance (a tracklet
+    claimed on a camera that disagrees with its stream), operations on a
+    subject that does not exist or is no longer active, a camera-local
+    tracklet claimed twice — by the same venue subject or by two different
+    ones — and venue time that runs backwards within one subject's history.
+
+    Every one of these would otherwise let two different camera-local
+    tracklets be silently reconciled into one identity, or one identity
+    silently forget who it was made of. Venue-local identity has no
+    biometric or appearance evidence to fall back on, so the only thing
+    protecting it from a wrong merge is refusing the operation outright
+    rather than guessing.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 
