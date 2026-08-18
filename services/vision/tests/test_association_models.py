@@ -14,17 +14,24 @@ import pytest
 from association_builders import METRIC, NORMALIZED, context, observation
 from atreides_vision.association import (
     AssociationOutcome,
+    AssociationRound,
     CameraSpatialContext,
     CandidatePair,
+    DecisionConfidence,
+    DecisionReason,
     GateReason,
     GateRejection,
     GeometricEvidence,
     GeometryTrust,
     ObservationGating,
     PairAssessment,
+    PairDecision,
+    SupportSummary,
     TrackObservation,
     VenueRegion,
+    candidate_key,
     observation_order_key,
+    tracklet_key,
 )
 from atreides_vision.behavior.coordinates import MotionPoint
 from atreides_vision.behavior.models import SubjectRef
@@ -397,3 +404,244 @@ class TestObservationGating:
 
         assert gating.subject == SubjectRef("cam_a", 1)
         assert gating.comparable == ()
+
+
+def support(
+    samples: int = 3,
+    *,
+    total_samples: int | None = None,
+    span_seconds: float = 0.5,
+    started_seconds: float | None = 10.0,
+    last_seconds: float = 10.5,
+    trust: GeometryTrust = GeometryTrust.VERIFIED,
+    max_separation_m: float = 0.5,
+    min_rival_margin_m: float | None = None,
+) -> SupportSummary:
+    return SupportSummary(
+        samples=samples,
+        total_samples=samples if total_samples is None else total_samples,
+        span_seconds=span_seconds,
+        started_seconds=started_seconds,
+        last_seconds=last_seconds,
+        trust=trust,
+        max_separation_m=max_separation_m,
+        min_rival_margin_m=min_rival_margin_m,
+    )
+
+
+def admissible() -> PairAssessment:
+    pair = CandidatePair(observation("cam_a", 1), observation("cam_b", 2))
+    return PairAssessment(pair=pair, evidence=evidence(separation_m=0.5))
+
+
+def excluded() -> PairAssessment:
+    pair = CandidatePair(observation("cam_a", 1), observation("cam_b", 2))
+    return PairAssessment(pair=pair, evidence=evidence(separation_m=40.0))
+
+
+def rejected() -> PairAssessment:
+    pair = CandidatePair(observation("cam_a", 1), observation("cam_a", 2))
+    return PairAssessment(
+        pair=pair, rejections=(GateRejection(GateReason.SAME_CAMERA, "one camera"),)
+    )
+
+
+class TestTrackletNames:
+    def test_a_tracklet_is_named_by_camera_stream_and_track_only(self) -> None:
+        """The frame it was seen on is not part of what the evidence is about."""
+        first = observation("cam_a", 1, frame_index=4)
+        later = observation("cam_a", 1, frame_index=9)
+
+        assert tracklet_key(first) == ("cam_a", 0, 1) == tracklet_key(later)
+
+    def test_a_restarted_stream_is_a_different_tracklet(self) -> None:
+        assert tracklet_key(observation("cam_a", 1)) != tracklet_key(
+            observation("cam_a", 1, stream_epoch=1)
+        )
+
+    def test_a_pair_is_named_the_same_however_the_cameras_were_enumerated(self) -> None:
+        one, other = observation("cam_a", 1), observation("cam_b", 2)
+
+        assert candidate_key(CandidatePair(one, other)) == candidate_key(CandidatePair(other, one))
+
+
+class TestSupportSummary:
+    def test_a_run_in_progress_must_say_when_it_began(self) -> None:
+        with pytest.raises(AssociationError, match="A run in progress has a start"):
+            support(samples=3, started_seconds=None)
+
+    def test_an_empty_run_cannot_claim_a_start(self) -> None:
+        with pytest.raises(AssociationError, match="A run in progress has a start"):
+            support(samples=0, total_samples=3, started_seconds=10.0, span_seconds=0.0)
+
+    def test_more_agreeing_observations_than_observations_is_incoherent(self) -> None:
+        with pytest.raises(AssociationError, match="counts are incoherent"):
+            support(samples=4, total_samples=2)
+
+    def test_verified_geometry_throughout_corroborates(self) -> None:
+        assert support().confidence is DecisionConfidence.CORROBORATED
+
+    def test_anything_weaker_stays_provisional(self) -> None:
+        assert support(trust=GeometryTrust.UNVERIFIED).confidence is DecisionConfidence.PROVISIONAL
+
+
+class TestPairDecision:
+    def test_a_decision_must_state_a_reason(self) -> None:
+        with pytest.raises(AssociationError, match="states no reason"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.AMBIGUOUS,
+                reasons=(),
+                support=support(),
+            )
+
+    def test_a_measured_pair_cannot_be_reported_as_never_measured(self) -> None:
+        with pytest.raises(AssociationError, match="is not a weaker UNASSOCIATED"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.NOT_COMPARABLE,
+                reasons=(DecisionReason.HARD_GATE_REJECTED,),
+            )
+
+    def test_a_measured_pair_must_carry_its_support(self) -> None:
+        with pytest.raises(AssociationError, match="unreported blind spot"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.AMBIGUOUS,
+                reasons=(DecisionReason.SUPPORT_NOT_SUSTAINED,),
+            )
+
+    def test_an_association_geometry_excludes_cannot_be_built(self) -> None:
+        with pytest.raises(AssociationError, match="although geometry excludes it"):
+            PairDecision(
+                assessment=excluded(),
+                outcome=AssociationOutcome.ASSOCIATED,
+                reasons=(DecisionReason.SUSTAINED_MUTUAL_AGREEMENT,),
+                support=support(max_separation_m=40.0),
+                confidence=DecisionConfidence.CORROBORATED,
+            )
+
+    def test_an_association_without_its_confidence_cannot_be_built(self) -> None:
+        with pytest.raises(AssociationError, match="without its support"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.ASSOCIATED,
+                reasons=(DecisionReason.SUSTAINED_MUTUAL_AGREEMENT,),
+                support=support(),
+            )
+
+    def test_an_association_must_state_the_rule_that_earned_it(self) -> None:
+        with pytest.raises(AssociationError, match="without sustained"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.ASSOCIATED,
+                reasons=(DecisionReason.GEOMETRY_EXCLUDED,),
+                support=support(),
+                confidence=DecisionConfidence.CORROBORATED,
+            )
+
+    def test_a_negative_outcome_cannot_borrow_the_association_reason(self) -> None:
+        with pytest.raises(AssociationError, match="claiming sustained mutual agreement"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.AMBIGUOUS,
+                reasons=(DecisionReason.SUSTAINED_MUTUAL_AGREEMENT,),
+                support=support(),
+            )
+
+    def test_only_an_association_states_a_confidence(self) -> None:
+        with pytest.raises(AssociationError, match="Only an association has one"):
+            PairDecision(
+                assessment=admissible(),
+                outcome=AssociationOutcome.AMBIGUOUS,
+                reasons=(DecisionReason.RIVAL_NOT_SEPARATED,),
+                support=support(),
+                confidence=DecisionConfidence.PROVISIONAL,
+            )
+
+    def test_two_tracklets_on_one_camera_cannot_be_associated(self) -> None:
+        """Fragment stitching is a different capability with different failure modes."""
+        pair = CandidatePair(observation("cam_a", 1), observation("cam_a", 2))
+        within_camera = PairAssessment(pair=pair, evidence=evidence(separation_m=0.5))
+
+        with pytest.raises(AssociationError, match="within camera"):
+            PairDecision(
+                assessment=within_camera,
+                outcome=AssociationOutcome.ASSOCIATED,
+                reasons=(DecisionReason.SUSTAINED_MUTUAL_AGREEMENT,),
+                support=support(),
+                confidence=DecisionConfidence.CORROBORATED,
+            )
+
+    def test_a_refused_pair_is_recorded_without_a_measurement(self) -> None:
+        decision = PairDecision(
+            assessment=rejected(),
+            outcome=AssociationOutcome.NOT_COMPARABLE,
+            reasons=(DecisionReason.HARD_GATE_REJECTED,),
+        )
+
+        assert not decision.is_associated
+        assert "support" not in decision.to_record()
+        assert decision.to_record()["reasons"] == ["hard_gate_rejected"]
+
+
+class TestAssociationRound:
+    def test_observations_must_be_in_canonical_order(self) -> None:
+        with pytest.raises(AssociationError, match="canonical order"):
+            AssociationRound(
+                venue_seconds=10.0,
+                observations=(observation("cam_b", 1), observation("cam_a", 1)),
+                decisions=(),
+            )
+
+    def test_decisions_must_be_in_canonical_order(self) -> None:
+        first = PairDecision(
+            assessment=admissible(),
+            outcome=AssociationOutcome.AMBIGUOUS,
+            reasons=(DecisionReason.SUPPORT_NOT_SUSTAINED,),
+            support=support(),
+        )
+        pair = CandidatePair(observation("cam_a", 1), observation("cam_c", 3))
+        second = PairDecision(
+            assessment=PairAssessment(pair=pair, evidence=evidence(separation_m=0.5)),
+            outcome=AssociationOutcome.AMBIGUOUS,
+            reasons=(DecisionReason.SUPPORT_NOT_SUSTAINED,),
+            support=support(),
+        )
+
+        with pytest.raises(AssociationError, match="canonical candidate order"):
+            AssociationRound(
+                venue_seconds=10.0,
+                observations=(
+                    observation("cam_a", 1),
+                    observation("cam_b", 2),
+                    observation("cam_c", 3),
+                ),
+                decisions=(second, first),
+            )
+
+    def test_asking_about_an_observation_that_was_not_there_is_an_error(self) -> None:
+        round_ = AssociationRound(venue_seconds=10.0, observations=(), decisions=())
+
+        with pytest.raises(AssociationError, match="was not observed"):
+            round_.outcome_for(SubjectRef("cam_a", 1))
+
+    def test_a_round_counts_every_outcome_it_reports(self) -> None:
+        decision = PairDecision(
+            assessment=rejected(),
+            outcome=AssociationOutcome.NOT_COMPARABLE,
+            reasons=(DecisionReason.HARD_GATE_REJECTED,),
+        )
+        round_ = AssociationRound(
+            venue_seconds=10.0,
+            observations=(observation("cam_a", 1), observation("cam_a", 2)),
+            decisions=(decision,),
+        )
+
+        assert round_.to_record()["outcome_counts"] == {
+            "associated": 0,
+            "ambiguous": 0,
+            "unassociated": 0,
+            "not_comparable": 1,
+        }
+        assert round_.associated == ()

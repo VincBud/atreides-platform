@@ -14,6 +14,7 @@ hand: separation, tolerance and allowance are all small multiples of a half.
 from __future__ import annotations
 
 from atreides_vision.association import (
+    AssociationDecisionConfig,
     AssociationGatingConfig,
     CameraSpatialContext,
     GeometryTrust,
@@ -37,6 +38,20 @@ GATING = AssociationGatingConfig(
     max_subject_speed_m_per_s=2.0,
     position_tolerance_m=1.0,
     ambiguity_margin_m=0.5,
+)
+
+#: Decision thresholds for the V0.4.2 engine. Ticks in the suite are 0.125 s
+#: apart, so three of them span exactly 0.25 s — a value with no floating-point
+#: remainder, which keeps "just sustained" an exact boundary rather than a
+#: rounding accident. The gap tolerance is below the TTL so a broken run and an
+#: expired pair can be exercised separately.
+DECIDING = AssociationDecisionConfig(
+    min_support_samples=3,
+    min_support_seconds=0.25,
+    max_support_gap_seconds=0.5,
+    acceptance_margin_m=0.5,
+    evidence_ttl_seconds=1.0,
+    max_tracked_pairs=64,
 )
 
 

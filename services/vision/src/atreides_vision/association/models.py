@@ -15,29 +15,42 @@ What lives here
 * :class:`CandidatePair` — two observations in a canonical order, so the same
   two observations are one candidate however they were enumerated.
 * :class:`GeometricEvidence` — what the shared floor plane says about a pair.
-* :class:`PairAssessment` and :class:`ObservationGating` — the verdicts, with
-  every rejection reason recorded.
+* :class:`PairAssessment` and :class:`ObservationGating` — the geometric
+  verdicts, with every rejection reason recorded.
+* :class:`SupportSummary`, :class:`PairDecision` and :class:`AssociationRound`
+  — V0.4.2's decision vocabulary: what sustained cross-camera agreement was
+  observed for a candidate, what was concluded from it, and why.
 
-Geometry rejects; it never merges
----------------------------------
+Geometry rejects; it never associates
+-------------------------------------
 :class:`AssociationOutcome` names all four answers the association capability
 can ever give, because a consumer must be able to handle them from the start.
-**Nothing in this milestone produces** :attr:`AssociationOutcome.ASSOCIATED`.
 Two people standing on the same square metre of floor at the same instant, seen
 by two cameras, are geometrically indistinguishable from one person seen twice;
-so agreement in space and time is *necessary* for a merge and nowhere near
-*sufficient* for one. Geometry can therefore veto a merge and never authorise
-one, and :class:`ObservationGating` refuses to be constructed with an
-``ASSOCIATED`` outcome rather than trusting a caller not to write it.
+so agreement in space and time is *necessary* for a positive association and
+nowhere near *sufficient* for one. Geometry can therefore veto and never
+authorise, and :class:`ObservationGating` — the V0.4.1 geometric result —
+refuses to be constructed with an ``ASSOCIATED`` outcome rather than trusting a
+caller not to write it.
+
+:class:`AssociationOutcome.ASSOCIATED` becomes reachable in V0.4.2, and only
+through :class:`PairDecision`, which is constructable with that outcome only
+when the evidence that authorises it is attached: a sustained agreement run, a
+confidence, and an admissible geometric assessment across two different
+cameras. The dangerous answer stays hard to express.
 
 Identity boundary
 -----------------
 :class:`~atreides_vision.behavior.models.SubjectRef` stays exactly
 ``(camera_id, track_id)`` — camera-scoped, tracker-assigned, not a person.
-Nothing here defines a venue-local identity, a merge, a subject store or a
-count of people. When a venue-local identity type arrives it is a distinct type
-in its own namespace, and it will be built from these assessments rather than
-from a reused tracker integer.
+Nothing here defines a venue-local identity, a subject store or a count of
+people. A :class:`PairDecision` is a statement about *two tracklets*, not about
+a person: it says the evidence supports treating them as one subject right now,
+and it names both ``(camera, track)`` observations that produced it. Turning a
+set of such decisions into one venue-local temporary identity is a later
+capability, and when that type arrives it is a distinct type in its own
+namespace, built from these decisions rather than from a reused tracker
+integer.
 
 Nothing here is biometric. No appearance descriptor, embedding, colour
 histogram, crop or pixel of any kind reaches this layer: an observation carries
@@ -59,17 +72,26 @@ from atreides_vision.timing import StreamRef, TimeUncertainty
 
 __all__ = [
     "AssociationOutcome",
+    "AssociationRound",
     "CameraSpatialContext",
+    "CandidateKey",
     "CandidatePair",
+    "DecisionConfidence",
+    "DecisionReason",
     "GateReason",
     "GateRejection",
     "GeometricEvidence",
     "GeometryTrust",
     "ObservationGating",
     "PairAssessment",
+    "PairDecision",
+    "SupportSummary",
     "TrackObservation",
+    "TrackletKey",
     "VenueRegion",
+    "candidate_key",
     "observation_order_key",
+    "tracklet_key",
 ]
 
 
@@ -740,4 +762,432 @@ class ObservationGating:
             "considered": len(self.assessments),
             "comparable": len(self.comparable),
             "assessments": [assessment.to_record() for assessment in self.assessments],
+        }
+
+
+#: A camera-local tracklet's stable identity across ticks:
+#: ``(camera_id, stream_epoch, track_id)``. It is *not* a venue-local identity
+#: and not a person — it is the same tracklet a camera-local tracker produced,
+#: named so that evidence about it can be carried from one venue instant to the
+#: next. ``stream_epoch`` is part of it because ``track_7`` before a reconnect
+#: and ``track_7`` after one are unrelated tracklets that share an integer.
+TrackletKey = tuple[str, int, int]
+
+#: Two tracklets in canonical order — the stable name of a candidate pair,
+#: independent of the frame it was observed on and of camera enumeration order.
+CandidateKey = tuple[TrackletKey, TrackletKey]
+
+
+def tracklet_key(observation: TrackObservation) -> TrackletKey:
+    """The observation's tracklet, without the frame it happened to be seen on.
+
+    :func:`observation_order_key` orders *observations*; this names the
+    *tracklet* behind them, which is what evidence accumulates against over
+    time. Sorting agrees with :func:`observation_order_key` because it is that
+    key with its last component dropped.
+    """
+    return (
+        observation.subject.camera_id,
+        observation.stream.stream_epoch,
+        observation.subject.track_id,
+    )
+
+
+def candidate_key(pair: CandidatePair) -> CandidateKey:
+    """The pair's stable name across venue instants.
+
+    :class:`CandidatePair` already sorts its members by
+    :func:`observation_order_key`, whose first three components are exactly
+    :func:`tracklet_key`, so this preserves that canonical order. Two distinct
+    tracklets can never tie on it, which is what makes the same two tracklets
+    reach the same evidence entry however the cameras were enumerated.
+    """
+    return (tracklet_key(pair.first), tracklet_key(pair.second))
+
+
+class DecisionReason(StrEnum):
+    """Why a candidate was decided the way it was. Recorded, never inferred.
+
+    A decision is only trustworthy if it can be traced to the rule that
+    produced it, and the *negative* reasons matter most: "no association here"
+    has to say whether nothing was measured, whether geometry excluded it,
+    whether the evidence was not yet sustained, or whether a rival could not be
+    separated. Those are four different facts about the venue and only one of
+    them is about the people.
+    """
+
+    #: A hard comparability gate rejected the pair. Which gates is in the
+    #: assessment's own rejection list.
+    HARD_GATE_REJECTED = "hard_gate_rejected"
+
+    #: Comparable, and the separation exceeded the admissible radius. A
+    #: statement about this instant only, never about the people.
+    GEOMETRY_EXCLUDED = "geometry_excluded"
+
+    #: The agreement run is real but too short — too few observations, or too
+    #: little venue time, or both. Not a rejection: an association that has not
+    #: yet earned the right to be asserted.
+    SUPPORT_NOT_SUSTAINED = "support_not_sustained"
+
+    #: A rival candidate on the same counterpart camera is too close in
+    #: separation for either to be preferred. Choosing the nearer would be a
+    #: coin flip presented as a fact.
+    RIVAL_NOT_SEPARATED = "rival_not_separated"
+
+    #: One side of the pair prefers a different partner on the other's camera.
+    #: An association neither side agrees on is not an association.
+    NOT_MUTUAL_BEST = "not_mutual_best"
+
+    #: Accepting this pair would give one observation two positive partners on
+    #: one counterpart camera. At one instant, one person is one track on one
+    #: camera, so all the rivals are refused rather than one being picked.
+    EXCLUSIVITY_CONFLICT = "exclusivity_conflict"
+
+    #: Accepting this pair would join a group of tracklets whose own pairwise
+    #: evidence contradicts itself — two of them on one camera, or two of them
+    #: geometrically excluded from each other. Transitivity is not evidence.
+    INCONSISTENT_EVIDENCE = "inconsistent_evidence"
+
+    #: The one positive reason: mutual, exclusive, separated agreement,
+    #: sustained across enough venue time and enough observations.
+    SUSTAINED_MUTUAL_AGREEMENT = "sustained_mutual_agreement"
+
+
+class DecisionConfidence(StrEnum):
+    """How far a positive association may be relied on. Not a probability.
+
+    Deliberately two coarse levels derived from a fact that was *established*
+    rather than from a score nobody calibrated: whether both contributing
+    cameras' viewpoints were verified against the calibration they are being
+    measured with. Degraded integrity therefore lowers confidence visibly
+    instead of being swallowed, which is the property the architecture asks
+    for; a number between 0 and 1 would imply a calibration this project has
+    not done.
+
+    The temporal strength of the evidence is not folded in here — it is
+    reported as measurements on :class:`SupportSummary`, where a reader can see
+    how many observations over how many seconds produced the decision.
+    """
+
+    #: At least one contributing camera's viewpoint was never confirmed.
+    PROVISIONAL = "provisional"
+
+    #: Every contributing camera's geometry was verified against its
+    #: calibration reference.
+    CORROBORATED = "corroborated"
+
+
+@dataclass(frozen=True, slots=True)
+class SupportSummary:
+    """The temporal evidence standing behind one candidate pair, as measurements.
+
+    ``samples`` and ``span_seconds`` describe the *current unbroken run of
+    agreement* — not the pair's whole life. A contradicting observation or a
+    gap ends the run and the counters restart, because a claim that two
+    tracklets agreed for three seconds must not span a second in which they
+    disagreed.
+
+    Both a count and a duration are reported because either alone is
+    misleading: a count is meaningless without a frame rate, and no frame rate
+    may be assumed here, while a duration alone could be two observations an
+    hour apart.
+    """
+
+    #: Consecutive agreeing observations in the run in progress. ``0`` when the
+    #: most recent observation broke it.
+    samples: int
+    #: Every observation ever recorded for this pair, agreeing or not. Lets a
+    #: reader see that a run was interrupted rather than never started.
+    total_samples: int
+    #: ``last_seconds - started_seconds`` of the current run, in venue seconds.
+    span_seconds: float
+    #: Venue time the current run began, or ``None`` when no run is in progress.
+    started_seconds: float | None
+    #: Venue time of the most recent observation of this pair.
+    last_seconds: float
+    #: Weakest geometry trust seen during the run — verified only if every
+    #: contributing observation was. With no run in progress, the most recent
+    #: observation's own trust.
+    trust: GeometryTrust
+    #: Largest separation, in metres, seen during the run; with no run in
+    #: progress, the most recent observation's own separation.
+    max_separation_m: float
+    #: Smallest lead the preferred partner held over its nearest rival during
+    #: the run, in metres. ``None`` when no rival was ever offered.
+    min_rival_margin_m: float | None
+
+    def __post_init__(self) -> None:
+        if self.samples < 0 or self.total_samples < self.samples:
+            raise AssociationError(
+                f"SupportSummary counts are incoherent: {self.samples} agreeing observations out "
+                f"of {self.total_samples} recorded."
+            )
+        for name, value in (
+            ("span_seconds", self.span_seconds),
+            ("last_seconds", self.last_seconds),
+            ("max_separation_m", self.max_separation_m),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise AssociationError(
+                    f"SupportSummary.{name} must be finite and non-negative, got {value!r}"
+                )
+        if (self.samples == 0) != (self.started_seconds is None):
+            raise AssociationError(
+                "A run in progress has a start and an empty run has none, got "
+                f"{self.samples} sample(s) with started_seconds={self.started_seconds!r}."
+            )
+
+    @property
+    def confidence(self) -> DecisionConfidence:
+        """Corroborated only when every contributing camera's geometry was verified."""
+        if self.trust is GeometryTrust.VERIFIED:
+            return DecisionConfidence.CORROBORATED
+        return DecisionConfidence.PROVISIONAL
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "samples": self.samples,
+            "total_samples": self.total_samples,
+            "span_seconds": round(self.span_seconds, 3),
+            "started_seconds": (
+                None if self.started_seconds is None else round(self.started_seconds, 3)
+            ),
+            "last_seconds": round(self.last_seconds, 3),
+            "trust": self.trust.value,
+            "max_separation_m": round(self.max_separation_m, 6),
+            "min_rival_margin_m": (
+                None if self.min_rival_margin_m is None else round(self.min_rival_margin_m, 6)
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PairDecision:
+    """What the association core concluded about one candidate pair, and why.
+
+    Carries its whole provenance: the V0.4.1 assessment it was decided from —
+    with both ``(camera, track)`` observations, every hard gate that refused
+    them and the geometry that measured them — plus the temporal support and
+    the reasons for the outcome. Nothing here is a person, an identity or a
+    count; it is a statement about two tracklets at one venue instant.
+
+    ``ASSOCIATED`` is constrained rather than trusted. It cannot be built
+    without an admissible cross-camera assessment, the sustained-agreement
+    reason, a support summary and a confidence, so no caller can assert a
+    positive association it has no evidence for.
+
+    Raises:
+        AssociationError: for a decision that does not match the evidence
+            attached to it.
+    """
+
+    assessment: PairAssessment
+    outcome: AssociationOutcome
+    #: Why, in the fixed order the core evaluates them. Never empty.
+    reasons: tuple[DecisionReason, ...]
+    #: The temporal evidence, present for every comparable pair. ``None``
+    #: exactly when nothing was measurable.
+    support: SupportSummary | None = None
+    #: Present only on a positive association: an outcome that is not an
+    #: association has no confidence to state.
+    confidence: DecisionConfidence | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reasons:
+            raise AssociationError(
+                f"Decision {self.outcome.value} for {self.assessment.pair} states no reason. An "
+                "association nobody can trace to a rule is not auditable."
+            )
+        comparable = self.assessment.is_comparable
+        if comparable == (self.outcome is AssociationOutcome.NOT_COMPARABLE):
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} is "
+                f"{'comparable' if comparable else 'not comparable'} yet was decided "
+                f"{self.outcome.value}. NOT_COMPARABLE means a hard gate refused the "
+                "measurement, and is not a weaker UNASSOCIATED."
+            )
+        if comparable and self.support is None:
+            raise AssociationError(
+                f"Comparable candidate {self.assessment.pair} carries no support summary. A pair "
+                "that was measured and not recorded is an unreported blind spot."
+            )
+        if self.outcome is not AssociationOutcome.ASSOCIATED:
+            self._check_not_associated()
+            return
+        self._check_associated()
+
+    def _check_not_associated(self) -> None:
+        if self.confidence is not None:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided {self.outcome.value} yet states a "
+                f"confidence of {self.confidence.value}. Only an association has one."
+            )
+        if DecisionReason.SUSTAINED_MUTUAL_AGREEMENT in self.reasons:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided {self.outcome.value} while "
+                "claiming sustained mutual agreement, which is the reason for an association."
+            )
+
+    def _check_associated(self) -> None:
+        if DecisionReason.SUSTAINED_MUTUAL_AGREEMENT not in self.reasons:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided ASSOCIATED without sustained "
+                "mutual agreement. A positive association states the evidence that earned it."
+            )
+        if not self.assessment.is_admissible:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided ASSOCIATED although geometry "
+                "excludes it. A merge geometry rules out corrupts every venue-level number "
+                "above it."
+            )
+        if self.support is None or self.confidence is None:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided ASSOCIATED without its support "
+                "and confidence. Every association carries its evidence and its uncertainty."
+            )
+        first, second = self.assessment.pair.cameras
+        if first == second:
+            raise AssociationError(
+                f"Candidate {self.assessment.pair} was decided ASSOCIATED within camera "
+                f"'{first}'. Joining two tracklets on one camera is fragment stitching, a "
+                "different capability with different failure modes."
+            )
+
+    @property
+    def pair(self) -> CandidatePair:
+        return self.assessment.pair
+
+    @property
+    def key(self) -> CandidateKey:
+        return candidate_key(self.assessment.pair)
+
+    @property
+    def subjects(self) -> tuple[SubjectRef, SubjectRef]:
+        """The two ``(camera_id, track_id)`` references this decision is about."""
+        return self.assessment.pair.subjects
+
+    @property
+    def is_associated(self) -> bool:
+        return self.outcome is AssociationOutcome.ASSOCIATED
+
+    def involves(self, subject: SubjectRef) -> bool:
+        return subject in self.assessment.pair.subjects
+
+    def to_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "outcome": self.outcome.value,
+            "reasons": [reason.value for reason in self.reasons],
+            "assessment": self.assessment.to_record(),
+        }
+        if self.support is not None:
+            record["support"] = self.support.to_record()
+        if self.confidence is not None:
+            record["confidence"] = self.confidence.value
+        return record
+
+    def __str__(self) -> str:
+        return f"{self.assessment.pair}: {self.outcome.value}"
+
+
+@dataclass(frozen=True, slots=True)
+class AssociationRound:
+    """Every cross-camera decision made at one venue instant.
+
+    Complete rather than filtered: a decision is emitted for every candidate
+    pair, including the ones a hard gate refused, because "these two cameras
+    never associate" is only diagnosable if the refusals are on the record too.
+
+    Ordering is canonical throughout — observations by
+    :func:`observation_order_key`, decisions by :func:`candidate_key` — so a
+    round is byte-identical between runs and independent of the order the
+    cameras were enumerated in.
+
+    Raises:
+        AssociationError: if the venue instant is not a real one, or the
+            contents are not in canonical order.
+    """
+
+    #: The session-relative venue instant these decisions describe.
+    venue_seconds: float
+    observations: tuple[TrackObservation, ...]
+    decisions: tuple[PairDecision, ...]
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.venue_seconds) or self.venue_seconds < 0:
+            raise AssociationError(
+                "AssociationRound.venue_seconds must be finite and non-negative, got "
+                f"{self.venue_seconds!r}."
+            )
+        keys = [observation_order_key(observation) for observation in self.observations]
+        if keys != sorted(keys):
+            raise AssociationError(
+                "AssociationRound observations must be in canonical order; an order that "
+                "depends on camera enumeration is not reproducible."
+            )
+        decision_keys = [decision.key for decision in self.decisions]
+        if decision_keys != sorted(decision_keys):
+            raise AssociationError(
+                "AssociationRound decisions must be in canonical candidate order; an order that "
+                "depends on camera enumeration is not reproducible."
+            )
+
+    @property
+    def associated(self) -> tuple[PairDecision, ...]:
+        """The positive associations, in canonical order."""
+        return tuple(decision for decision in self.decisions if decision.is_associated)
+
+    def decisions_for(self, subject: SubjectRef) -> tuple[PairDecision, ...]:
+        """Every decision this subject took part in, in canonical order."""
+        self._require_present(subject)
+        return tuple(decision for decision in self.decisions if decision.involves(subject))
+
+    def outcome_for(self, subject: SubjectRef) -> AssociationOutcome:
+        """What this instant established about one observation.
+
+        The strongest outcome any of its candidates reached: an association if
+        one was made, otherwise an unresolved candidate if one remains,
+        otherwise exclusion — and ``NOT_COMPARABLE`` when nothing about this
+        observation could be measured at all, which is what a single-camera
+        venue produces for every observation, every time.
+        """
+        decisions = self.decisions_for(subject)
+        outcomes = {decision.outcome for decision in decisions}
+        for outcome in (
+            AssociationOutcome.ASSOCIATED,
+            AssociationOutcome.AMBIGUOUS,
+            AssociationOutcome.UNASSOCIATED,
+        ):
+            if outcome in outcomes:
+                return outcome
+        return AssociationOutcome.NOT_COMPARABLE
+
+    def partners_of(self, subject: SubjectRef) -> tuple[SubjectRef, ...]:
+        """The subjects positively associated with ``subject``, in canonical order.
+
+        A list of ``(camera_id, track_id)`` references and nothing more. It is
+        not an identity, not a group and not a count of people: resolving a set
+        of associations into one venue-local temporary subject is a later
+        capability that must not be improvised from this.
+        """
+        return tuple(
+            decision.pair.other_than(subject).subject
+            for decision in self.decisions_for(subject)
+            if decision.is_associated
+        )
+
+    def _require_present(self, subject: SubjectRef) -> None:
+        if all(observation.subject != subject for observation in self.observations):
+            raise AssociationError(
+                f"{subject} was not observed at venue second {self.venue_seconds}"
+            )
+
+    def to_record(self) -> dict[str, Any]:
+        counts = {outcome.value: 0 for outcome in AssociationOutcome}
+        for decision in self.decisions:
+            counts[decision.outcome.value] += 1
+        return {
+            "venue_seconds": round(self.venue_seconds, 3),
+            "observations": [observation.to_record() for observation in self.observations],
+            "outcome_counts": counts,
+            "decisions": [decision.to_record() for decision in self.decisions],
         }
