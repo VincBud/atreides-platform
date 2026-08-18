@@ -105,6 +105,22 @@ class ValidationError(AtreidesVisionError):
     """
 
 
+class AssociationError(AtreidesVisionError):
+    """Raised when cross-camera association is asked for the impossible.
+
+    Covers candidates that cannot exist (an observation paired with itself),
+    observations that contradict themselves (a subject, a stream and a spatial
+    context naming different cameras, or a position in a space the context does
+    not declare), and results that would over-claim (a gating verdict asserting
+    an association geometry cannot establish).
+
+    Every one of these would otherwise produce a confident statement that two
+    camera-local tracklets are one person. A wrong merge corrupts every
+    venue-level number above it and is harder to detect than a missed one, so
+    the impossible cases raise rather than resolve.
+    """
+
+
 class VenueSessionError(AtreidesVisionError):
     """Raised when a multi-camera venue session cannot be described or walked.
 
