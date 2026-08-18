@@ -95,35 +95,33 @@ defect; an exclusion discovered later is.
 - Concerns for the human, including anything that needs approval before it is built.
 
 Do not commit or push. Leave the work in the working tree.
-
 ## TOKEN / EXECUTION DISCIPLINE
 
-Keep implementation contexts small and avoid redundant work.
+Keep implementation work bounded and context-efficient.
 
-### During implementation
-- Search before reading; read only relevant files/ranges.
-- Do not repeatedly reread unchanged files.
-- Run targeted tests for the code currently being changed.
-- Prefer parameterized representative boundary coverage over exhaustive combinatorial test matrices.
-- Every new test must protect a distinct behavior, invariant, regression, or boundary.
-- More than approximately 80 new tests requires explicit justification before proceeding.
-- Do not run the full repository test suite during ordinary implementation iterations.
+### Implementation
+- Search before reading.
+- Read only relevant files and ranges.
+- Do not reread unchanged files without a concrete reason.
+- Run only targeted tests while implementing.
+- Prefer representative parameterized tests over combinatorial matrices.
+- Every new test must protect a distinct contract, regression, or boundary.
+- Keep ordinary milestone additions below 60 new tests unless the task genuinely requires more; if so, stop and report why before expanding further.
+- Do not run the repository-wide test suite during ordinary implementation iterations.
 
 ### Final quality gate
-Run the full quality gate once after targeted tests are green:
+After targeted tests are green, run exactly once:
 1. `uv run pytest`
 2. `uv run ruff check .`
 3. `uv run ruff format --check .`
 4. `uv run mypy`
 
-Do not repeat a successful full quality gate merely to demonstrate determinism.
+If a gate fails, fix and rerun the affected check first.
+Repeat the complete quality gate only if the fix can plausibly affect unrelated code.
 
-After a failure:
-- f- f- f- f- f- f- f- f- f- f- f-tly affected check/tests first,
-- repeat the full gate only when the fix could plausibly affect unrelated code or when final verification requires it.
-
-### Context discipline
-- Avoid dumping complete large files, diffs, or logs when targeted inspection is sufficient.
-- Keep tool output narrow with grep, sed ranges, targeted pytest paths, and concise git commands.
-- Do not perform unrelated environment/setup investigations during a milestone.
-- Keep the final report concise and avoid repeating the same findings in multiple forms.
+### Context
+- Keep Bash output narrow.
+- Do not cat large files when grep or sed ranges are sufficient.
+- Do not perform unrelated setup or environment investigation.
+- Do not run redundant determinism checks unless determinism itself changed.
+- Keep the final report concise.

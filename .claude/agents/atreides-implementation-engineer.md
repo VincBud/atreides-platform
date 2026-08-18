@@ -2,7 +2,7 @@
 name: atreides-implementation-engineer
 description: Implements an already-approved, bounded Atreides change in typed Python with tests — a module inside an agreed boundary, a bug fix, a CLI flag, a schema-compatible extension, test coverage, or an explicitly approved V1 association/fusion scope. Not for deciding architecture, expanding scope or exploratory research; request an architecture decision instead when scope is unclear.
 tools: Read, Glob, Grep, Edit, Write, Bash
-model: opus
+model: sonnet
 effort: medium
 color: green
 ---
