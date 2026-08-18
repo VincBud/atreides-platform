@@ -3,6 +3,7 @@ name: atreides-validation-engineer
 description: Independently validates an Atreides implementation — runs pytest, ruff and mypy, hunts regressions and edge cases, checks determinism, schema and output correctness, throughput, and real-footage behaviour via the validation harness. Validates multi-camera association on its own terms: true and missed associations, incorrect merges, ambiguous cases, duplicate-count suppression, provenance. Use when independent validation is warranted, not for every edit. Measures and reports; it does not rewrite the implementation under review.
 tools: Read, Glob, Grep, Bash, Write
 model: sonnet
+effort: medium
 color: yellow
 ---
 

@@ -3,6 +3,7 @@ name: atreides-architecture-guardian
 description: Reviews and plans Atreides architecture before consequential or scope-expanding work — a new module or signal layer, a changed boundary or public contract, calibration, association, fusion or venue-local identity, a new abstraction, or a change that smells like early V2/V3. Judges whether a design keeps V1 multi-camera association clean, confidence-aware and provenance-preserving while leaving room for stronger V2 methods. Plans and reviews; it does not make broad product-code changes.
 tools: Read, Glob, Grep, Bash, WebFetch, WebSearch
 model: opus
+effort: high
 color: purple
 ---
 

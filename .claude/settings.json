@@ -1,1 +1,9 @@
-{}
+{
+  "effortLevel": "high",
+  "autoCompactEnabled": true,
+  "autoCompactWindow": 120000,
+  "disableWorkflows": true,
+  "env": {
+    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"
+  }
+}

@@ -3,6 +3,7 @@ name: atreides-vision-researcher
 description: Computer-vision and perception specialist for Atreides — detection, tracking, occlusion, calibration and homography, ReID, multi-camera association strategies, camera topology and overlap, extreme lighting, crowd and interaction geometry. Use for a genuine unresolved perception question: choosing between algorithms, diagnosing a perception failure, judging what a capability would cost. Biased toward the simplest sufficiently robust V1 association strategy that keeps a path open to stronger V2 methods. Recommends with evidence; it does not expand scope or implement.
 tools: Read, Glob, Grep, Bash, WebSearch, WebFetch
 model: opus
+effort: high
 color: cyan
 ---
 

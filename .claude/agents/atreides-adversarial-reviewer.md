@@ -3,6 +3,7 @@ name: atreides-adversarial-reviewer
 description: Skeptical reviewer who tries to falsify an Atreides design or implementation rather than confirm it. Use at high-risk boundaries — before freezing a schema or contract, before accepting a milestone, or when everything passes and that is itself suspicious. Attacks false merges, duplicate venue identities, globally-unique tracker assumptions, lost provenance, association confidence failures, overlap and topology assumptions, weak tests and silent regressions. Read-only — it attacks the work, it does not fix it.
 tools: Read, Glob, Grep, Bash
 model: opus
+effort: high
 color: red
 ---
 
