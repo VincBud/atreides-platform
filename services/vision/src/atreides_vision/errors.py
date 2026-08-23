@@ -169,6 +169,22 @@ class FusionError(AtreidesVisionError):
     """
 
 
+class OccupancyError(AtreidesVisionError):
+    """Raised when venue-level current occupancy is asked for the impossible.
+
+    Covers a snapshot whose bookkeeping does not add up (a contributing venue
+    subject with no currently-observed members, a tracklet counted twice, or
+    a total that does not reconcile with the raw count of currently observed
+    tracklets) and reporting failures for the occupancy stream.
+
+    Occupancy never invents a merge to make a number tidier and never
+    swallows a contradiction between the raw count it observed and the count
+    it produced: either would let a duplicate silently vanish or a real
+    person silently disappear from the count, which is worse than failing
+    loudly.
+    """
+
+
 class DetectorError(AtreidesVisionError):
     """Raised when the detector cannot be initialised or fails at inference."""
 
