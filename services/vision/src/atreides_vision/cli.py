@@ -101,6 +101,12 @@ from atreides_vision.venue.reporting import (
 )
 from atreides_vision.venue.session import VenueSession, VideoSourceCursor
 from atreides_vision.venue.timebase import VenueTimebase
+from atreides_vision.venue_validation import (
+    VenueValidationCameraConfig,
+    VenueValidationConfig,
+    VenueValidationSummary,
+    run_venue_validation,
+)
 from atreides_vision.video.processor import ProcessingResult, VideoProcessor
 from atreides_vision.video.sink import Mp4VideoSink
 from atreides_vision.video.source import FileVideoSource, VideoMetadata, read_reference_frame
@@ -696,6 +702,197 @@ def _add_venue_commands(
         help="Enable debug logging.",
     )
     inspect_parser.set_defaults(handler=_venue_inspect_command)
+
+    validate_parser = venue_sub.add_parser(
+        "validate",
+        help="Run a venue session end to end and write the V0.4.8 validation artifacts.",
+        description=(
+            "Drive every camera in a session through the full runtime — detection, "
+            "camera-local tracking, calibration, behaviour, cross-camera association, "
+            "fusion, venue-local temporary identity and occupancy — and write the "
+            "association/fusion, occupancy and run-summary artifacts. This is an "
+            "engineering harness: it measures what executed, never how accurate it was. "
+            "Unannotated footage yields no association or occupancy accuracy of any kind."
+        ),
+    )
+    validate_parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Venue session manifest JSON (e.g. config/venue/example.json).",
+    )
+    validate_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        metavar="DIR",
+        help="Directory for the run's artifacts. Created if it does not exist.",
+    )
+    validate_parser.add_argument(
+        "--calibration",
+        action="append",
+        default=[],
+        metavar="CAMERA=PATH",
+        help=(
+            "Calibration document for one camera, repeatable. A camera without one runs "
+            "uncalibrated: it still contributes tracks, but produces no venue metres, so "
+            "association reports it as NOT_COMPARABLE rather than inventing coordinates."
+        ),
+    )
+    validate_parser.add_argument(
+        "--calibration-reference",
+        action="append",
+        default=[],
+        metavar="CAMERA=PATH",
+        help=(
+            "Integrity reference still for one camera, repeatable. Requires that camera's "
+            "--calibration: there is no metric claim to invalidate without one."
+        ),
+    )
+    validate_parser.add_argument(
+        "--integrity-report-only",
+        action="store_true",
+        help=(
+            "Report drift without withholding metric output, for every monitored camera. "
+            "Guarded is the default, because a moved camera's metres are wrong and wrong "
+            "metres are worse than absent ones."
+        ),
+    )
+    validate_parser.add_argument(
+        "--confidence",
+        type=float,
+        default=DEFAULT_DETECTION_CONFIDENCE,
+        metavar="FLOAT",
+        help=f"Minimum detection confidence. Default: {DEFAULT_DETECTION_CONFIDENCE:.2f}.",
+    )
+    validate_parser.add_argument(
+        "--device",
+        type=Device,
+        choices=list(Device),
+        default=Device.AUTO,
+        help="Compute device: auto, cpu, mps or cuda. Default: auto.",
+    )
+    validate_parser.add_argument(
+        "--tracker",
+        type=Tracker,
+        choices=list(Tracker),
+        default=DEFAULT_TRACKER,
+        help=f"Camera-local multi-object tracker. Default: {DEFAULT_TRACKER.value}.",
+    )
+    validate_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+    validate_parser.set_defaults(handler=_venue_validate_command)
+
+
+def _camera_path_arguments(values: Sequence[str], flag: str) -> dict[str, Path]:
+    """Parse repeated ``CAMERA=PATH`` arguments into a mapping.
+
+    Raises:
+        ConfigurationError: on a malformed or repeated entry.
+    """
+    parsed: dict[str, Path] = {}
+    for value in values:
+        camera_id, separator, raw_path = value.partition("=")
+        if not separator or not camera_id.strip() or not raw_path.strip():
+            raise ConfigurationError(
+                f"{flag} expects CAMERA=PATH (e.g. {flag} entrance_north=cal.json), got {value!r}."
+            )
+        if camera_id in parsed:
+            raise ConfigurationError(f"{flag} names camera {camera_id!r} more than once.")
+        parsed[camera_id] = Path(raw_path)
+    return parsed
+
+
+def _venue_camera_configs(args: argparse.Namespace) -> tuple[VenueValidationCameraConfig, ...]:
+    """Per-camera spatial configuration, in canonical camera order.
+
+    Raises:
+        ConfigurationError: if a camera has an integrity reference but no
+            calibration, which would monitor geometry nothing depends on.
+    """
+    calibrations = _camera_path_arguments(args.calibration, "--calibration")
+    references = _camera_path_arguments(args.calibration_reference, "--calibration-reference")
+
+    unmatched = sorted(set(references) - set(calibrations))
+    if unmatched:
+        raise ConfigurationError(
+            f"--calibration-reference names {', '.join(unmatched)} without --calibration for "
+            "the same camera. Integrity monitoring checks a calibration's geometry, and an "
+            "uncalibrated camera makes no metric claim to invalidate."
+        )
+
+    return tuple(
+        VenueValidationCameraConfig(
+            camera_id=camera_id,
+            calibration_path=calibrations[camera_id],
+            integrity_reference_path=references.get(camera_id),
+            integrity_report_only=args.integrity_report_only and camera_id in references,
+        )
+        for camera_id in sorted(calibrations)
+    )
+
+
+def _venue_validate_command(args: argparse.Namespace) -> int:
+    """Run one venue session end to end and write its validation artifacts."""
+    _configure_logging(args.verbose)
+
+    config = VenueValidationConfig(
+        manifest=load_venue_manifest(args.manifest),
+        output_dir=args.output_dir,
+        cameras=_venue_camera_configs(args),
+        detector=DetectorConfig(
+            confidence_threshold=args.confidence, device=resolve_device(args.device)
+        ),
+        tracker=args.tracker,
+    )
+
+    logger.info("Atreides Vision %s — V0.4.8 end-to-end venue validation", __version__)
+    logger.info("Manifest:    %s", args.manifest)
+    logger.info(
+        "Session:     '%s' — %d camera(s), %d stream(s), %d calibrated",
+        config.session_id,
+        len(config.manifest),
+        config.manifest.stream_count,
+        len(config.cameras),
+    )
+
+    detector = RFDetrPersonDetector(config.detector)
+    logger.info("Loading detector weights (first run may download them)...")
+    detector.load()
+    logger.info("Detector ready.")
+
+    summary = run_venue_validation(
+        config,
+        detector=detector,
+        tracker_factory=lambda tracker_config: build_tracker(args.tracker, tracker_config),
+    )
+    _log_venue_validation_completion(summary, config)
+    return EXIT_OK
+
+
+def _log_venue_validation_completion(
+    summary: VenueValidationSummary, config: VenueValidationConfig
+) -> None:
+    """State what ran, where the artifacts are, and what they do not prove."""
+    logger.info("Done.")
+    logger.info("Venue instants:      %d", summary.venue_instants)
+    logger.info("Source frames:       %d", summary.source_frames_processed)
+    logger.info("Observations:        %d", summary.observations_emitted)
+    for stream in summary.zero_frame_streams:
+        logger.info("  %-16s contributed no frames", str(stream))
+    logger.info("Association report:  %s", config.association_report_path)
+    logger.info("Occupancy report:    %s", config.occupancy_report_path)
+    logger.info("Run summary:         %s", config.summary_path)
+    logger.info(
+        "Note:        execution statistics only. This footage is NOT_ANNOTATED, so these "
+        "counts contain no association accuracy, no occupancy accuracy and no false-merge "
+        "rate. Venue-local identity is temporary and session-scoped; nothing is persisted."
+    )
 
 
 def _venue_inspect_command(args: argparse.Namespace) -> int:
