@@ -191,3 +191,19 @@ class DetectorError(AtreidesVisionError):
 
 class TrackerError(AtreidesVisionError):
     """Raised when the tracker cannot be initialised or fails during update."""
+
+
+class WildtrackDatasetError(AtreidesVisionError):
+    """Raised when the WILDTRACK validation dataset is malformed or unusable.
+
+    Covers a dataset root that does not have the expected structure (missing
+    camera directories, an unsupported camera count, calibration files that
+    cannot be located), image or annotation frame sets that are not internally
+    consistent, and individual annotation or calibration records that do not
+    parse.
+
+    This error is confined to :mod:`atreides_vision.venue_validation.datasets.wildtrack`,
+    which is offline validation infrastructure. Nothing in the runtime
+    detection, tracking, association, identity or occupancy path can raise or
+    catch it, because nothing there is allowed to import that package.
+    """
