@@ -86,6 +86,10 @@ from atreides_vision.venue_validation.datasets.wildtrack.runtime import (
     WildtrackStreamSpec,
     build_wildtrack_stream_specs,
 )
+from atreides_vision.venue_validation.datasets.wildtrack.session import (
+    WildtrackRuntimeSession,
+    build_wildtrack_runtime_session,
+)
 from atreides_vision.venue_validation.datasets.wildtrack.time import WildtrackFrameId
 
 __all__ = [
@@ -104,7 +108,9 @@ __all__ = [
     "WildtrackIntrinsic",
     "WildtrackPersonAnnotation",
     "WildtrackPersonId",
+    "WildtrackRuntimeSession",
     "WildtrackStreamSpec",
+    "build_wildtrack_runtime_session",
     "build_wildtrack_stream_specs",
     "calibration_name_for",
     "camera_id_for_view_num",
