@@ -77,11 +77,18 @@ def test_trailing_image_without_annotation_is_structurally_excluded(tmp_path: Pa
     assert all("00000010" not in p.name for p in spec.image_paths)
 
 
-def test_offsets_are_zero_for_every_stream(tmp_path: Path) -> None:
+def test_streams_carry_zero_nominal_offset_and_published_alignment_accuracy(
+    tmp_path: Path,
+) -> None:
     layout = _real_dataset(tmp_path)
     for spec in build_wildtrack_stream_specs(layout):
+        # WILDTRACK frame ids name corresponding samples on one dataset timeline,
+        # so the nominal/model offset is exactly zero...
         assert spec.offset_seconds == 0.0
-        assert spec.offset_accuracy_seconds == 0.0
+        # ...but the published physical synchronization accuracy (50 ms, then
+        # manually refined) is carried as the conservative alignment half-width,
+        # never zero.
+        assert spec.offset_accuracy_seconds == 0.05
         assert spec.declared_fps == 2.0
 
 

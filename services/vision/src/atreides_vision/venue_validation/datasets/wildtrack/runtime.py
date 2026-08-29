@@ -13,8 +13,14 @@ trailing extracted image that has no annotation.
 A :class:`WildtrackStreamSpec` is a deterministic, path-carrying description of
 one camera's contribution — canonical camera order, canonical frame order, the
 declared 2 fps rate derived from the dataset's own documented timing, and the
-venue-timeline offset (exactly zero: the seven cameras are synchronized and
-frame ``00000000`` is every camera's instant zero). Opening it yields an
+venue-timeline offset. That nominal offset is ``0.0`` s — WILDTRACK frame
+identifiers name corresponding samples on one shared dataset timeline, so the
+model places every camera at the same instant zero. That is a statement about
+the *dataset model*, not a claim that the original physical exposures were
+aligned to the picosecond: the WILDTRACK publication reports an initial
+synchronization accuracy of 50 ms, then refined by manual inspection, and that
+50 ms is carried as the conservative symmetric alignment uncertainty
+(:data:`WILDTRACK_STREAM_OFFSET_ACCURACY_SECONDS`). Opening it yields an
 ordinary :class:`ImageSequenceVideoSource`. Registration on a
 :class:`~atreides_vision.venue.timebase.VenueTimebase` belongs to the runner
 seam that consumes these specs, not here.
@@ -49,13 +55,21 @@ __all__ = [
 #: :data:`FRAME_STEP` frames) — never a bare literal ``2.0``.
 WILDTRACK_DECLARED_FPS = FRAME_RATE_HZ / FRAME_STEP
 
-#: WILDTRACK's seven cameras are hardware-synchronized and its frame identifiers
-#: are a shared frame count: frame ``00000000`` is one instant across all seven
-#: views. Every stream therefore sits on the venue timeline with no offset...
+#: WILDTRACK's frame identifiers are a shared sample index on one common dataset
+#: timeline: frame ``00000000`` is the same modelled instant across all seven
+#: views. The nominal (model) offset of every stream on the venue timeline is
+#: therefore exactly zero.
 WILDTRACK_STREAM_OFFSET_SECONDS = 0.0
-#: ...and, because that offset is a property of the published synchronization
-#: rather than an operator's estimate, with no offset uncertainty either.
-WILDTRACK_STREAM_OFFSET_ACCURACY_SECONDS = 0.0
+#: The conservative symmetric half-width on that alignment. It is *not* zero: the
+#: nominal offset above is a property of the dataset's frame-index model, not a
+#: guarantee that the original camera exposures coincided exactly. The WILDTRACK
+#: publication states the sequences were initially synchronized to within 50 ms
+#: and then refined by manual inspection, so 50 ms is used here as the declared
+#: published alignment uncertainty. It is not a frame-rate error and not
+#: inter-frame jitter — it is the symmetric timing uncertainty that the current
+#: Atreides timing model attaches to this declared offset, and the timing
+#: doctrine's refusal of a zero declared half-width is left untouched.
+WILDTRACK_STREAM_OFFSET_ACCURACY_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
