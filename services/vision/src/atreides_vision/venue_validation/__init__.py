@@ -22,6 +22,11 @@ from atreides_vision.venue_validation.models import (
     VenueValidationStreamSummary,
     VenueValidationSummary,
 )
+from atreides_vision.venue_validation.observer import (
+    VenueSubjectMembershipSnapshot,
+    VenueValidationInstantSnapshot,
+    VenueValidationObserver,
+)
 from atreides_vision.venue_validation.reporting import (
     VENUE_VALIDATION_SUMMARY_SCHEMA_VERSION,
     summary_record,
@@ -32,8 +37,11 @@ from atreides_vision.venue_validation.runner import open_stream_source, run_venu
 __all__ = [
     "GROUND_TRUTH_STATUS",
     "VENUE_VALIDATION_SUMMARY_SCHEMA_VERSION",
+    "VenueSubjectMembershipSnapshot",
     "VenueValidationCameraConfig",
     "VenueValidationConfig",
+    "VenueValidationInstantSnapshot",
+    "VenueValidationObserver",
     "VenueValidationStreamSummary",
     "VenueValidationSummary",
     "open_stream_source",

@@ -21,6 +21,31 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "atreides_vision"
 PACKAGE_ROOT = SOURCE_ROOT / "venue_validation"
 RUNNER_MODULE = PACKAGE_ROOT / "runner.py"
 MODULES = sorted(PACKAGE_ROOT.rglob("*.py"))
+DATASETS_ROOT = PACKAGE_ROOT / "datasets"
+
+#: Every module of the generic validation harness — everything under
+#: ``venue_validation`` except the dataset-specific subtree. The whole of it,
+#: not just ``observer.py``, must stay free of WILDTRACK / ground-truth /
+#: evaluator coupling: a generic harness that quietly imports one dataset's
+#: types has stopped being generic.
+NON_DATASET_MODULES = sorted(module for module in MODULES if DATASETS_ROOT not in module.parents)
+
+
+def dataset_coupling_offenders(imported: set[str]) -> set[str]:
+    """Imports that couple a module to a specific dataset / its evaluator.
+
+    ``venue_validation.datasets.*`` (the WILDTRACK adapter and any sibling),
+    anything named for WILDTRACK (module or imported symbol, e.g.
+    ``WildtrackPersonId``), and a ``wildtrack_eval`` GT/evaluator module.
+    """
+    return {
+        name
+        for name in imported
+        if name.startswith("atreides_vision.venue_validation.datasets")
+        or "wildtrack" in name.lower()
+        or name.endswith("wildtrack_eval")
+    }
+
 
 #: A composition root wires layers together, so its allowed reach is wide. It is
 #: bounded by what the documented end-to-end flow actually needs.
@@ -170,6 +195,51 @@ class TestImportBoundaries:
                 if name.startswith("atreides_vision.venue_validation")
             }
             assert reached == set(), f"{module} imports {sorted(reached)}"
+
+
+class TestGenericObserverHasNoDatasetCoupling:
+    """The V0.4.9b-C observer seam sees runtime predictions only.
+
+    It must not reach sideways into dataset or ground-truth adapters: the
+    direction is runtime -> snapshot -> observer -> (later) evaluator, and the
+    evaluator is where any reference data joins, never the observer.
+    """
+
+    OBSERVER_MODULE = PACKAGE_ROOT / "observer.py"
+
+    def test_the_observer_imports_no_dataset_or_ground_truth_code(self) -> None:
+        offending = dataset_coupling_offenders(imported_modules(self.OBSERVER_MODULE))
+        assert offending == set(), f"observer.py couples to dataset code: {sorted(offending)}"
+
+    @pytest.mark.parametrize("module", NON_DATASET_MODULES, ids=lambda path: path.name)
+    def test_no_generic_harness_module_couples_to_dataset_code(self, module: Path) -> None:
+        offending = dataset_coupling_offenders(imported_modules(module))
+        assert offending == set(), (
+            f"{module.name} couples the generic harness to dataset code: {sorted(offending)}"
+        )
+
+    def test_the_datasets_subtree_is_the_scanned_boundary(self) -> None:
+        names = {module.name for module in NON_DATASET_MODULES}
+        assert {"runner.py", "config.py", "__init__.py", "observer.py"} <= names
+        assert not any(DATASETS_ROOT in module.parents for module in NON_DATASET_MODULES)
+
+    def test_the_guard_logic_catches_a_synthetic_forbidden_import(self) -> None:
+        # A hypothetical `from ...datasets.wildtrack.runtime import WildtrackPersonId`
+        # or `import wildtrack_eval` added to runner/config/observer would be caught.
+        synthetic = {
+            "atreides_vision.venue_validation.datasets.wildtrack.runtime",
+            "atreides_vision.venue_validation.datasets.wildtrack_eval",
+            "atreides_vision.association.models",
+            "dataclasses",
+        }
+        assert dataset_coupling_offenders(synthetic) == {
+            "atreides_vision.venue_validation.datasets.wildtrack.runtime",
+            "atreides_vision.venue_validation.datasets.wildtrack_eval",
+        }
+
+    def test_the_datasets_subtree_may_import_its_own_dataset_modules(self) -> None:
+        wildtrack_init = DATASETS_ROOT / "wildtrack" / "__init__.py"
+        assert dataset_coupling_offenders(imported_modules(wildtrack_init)) != set()
 
 
 class TestAdapterIsTheOnlySeam:

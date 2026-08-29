@@ -81,6 +81,10 @@ from atreides_vision.venue_validation.models import (
     VenueValidationSummary,
     stream_summary_sort_key,
 )
+from atreides_vision.venue_validation.observer import (
+    VenueValidationObserver,
+    build_instant_snapshot,
+)
 from atreides_vision.venue_validation.reporting import write_validation_summary
 from atreides_vision.video.processor import VideoProcessor
 from atreides_vision.video.source import (
@@ -263,6 +267,7 @@ def run_venue_validation(
     detector: PersonDetector,
     tracker_factory: Callable[[TrackerConfig], MultiObjectTracker],
     source_factory: Callable[[VenueStreamEntry], VideoSource] = open_stream_source,
+    observer: VenueValidationObserver | None = None,
 ) -> VenueValidationSummary:
     """Run one venue session end to end and write its validation artifacts.
 
@@ -280,6 +285,14 @@ def run_venue_validation(
             stream's own frame rate. A tracker shared between two cameras would
             continue one camera's track ids onto another's people.
         source_factory: Opens one manifest stream. Defaults to a real file.
+        observer: An optional read-only validation seam. When given, it is
+            called exactly once per venue instant with an immutable
+            :class:`~atreides_vision.venue_validation.observer.VenueValidationInstantSnapshot`
+            of what the runtime produced for that instant, *after* association,
+            fusion and occupancy have all completed. Its return value is
+            ignored and it cannot influence the run; if it raises, the run
+            fails like any other layer and writes no summary. Defaults to
+            ``None`` — the runtime path is byte-for-byte unchanged without it.
 
     Returns:
         The run's execution statistics. They describe what ran — never how
@@ -377,6 +390,12 @@ def run_venue_validation(
 
             association_writer.write_instant(result, pipeline.registry)
             occupancy_writer.write_snapshot(snapshot)
+
+            # Read-only, once per instant, after every runtime decision for this
+            # instant is final. A failure here fails the run; it never feeds
+            # back into the next instant.
+            if observer is not None:
+                observer(build_instant_snapshot(result, snapshot))
 
             association_counts.update(decision.outcome for decision in result.round.decisions)
             integration_counts.update(outcome.outcome for outcome in result.integration.outcomes)
