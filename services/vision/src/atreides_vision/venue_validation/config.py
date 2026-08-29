@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from atreides_vision.calibration.fitting import CalibrationFit
 from atreides_vision.config import DEFAULT_TRACKER, DetectorConfig, Tracker
 from atreides_vision.errors import ConfigurationError
 from atreides_vision.identity.config import VenueIdentityConfig
@@ -38,15 +39,26 @@ SUMMARY_FILENAME = "venue_validation_summary.json"
 class VenueValidationCameraConfig:
     """Camera-local spatial configuration for one manifest camera.
 
-    Both paths are optional and independent. A camera with no calibration runs
-    uncalibrated — it still contributes tracks and occupancy, it simply produces
-    no venue-frame geometry, so association gates it as ``NOT_COMPARABLE``
-    instead of inventing coordinates for it.
+    Both references are optional and independent. A camera with no calibration
+    runs uncalibrated — it still contributes tracks and occupancy, it simply
+    produces no venue-frame geometry, so association gates it as
+    ``NOT_COMPARABLE`` instead of inventing coordinates for it.
+
+    Calibration may be supplied either as a document path (``calibration_path``,
+    loaded and solved by the runner) or as an already-built
+    :class:`~atreides_vision.calibration.fitting.CalibrationFit`
+    (``calibration_fit``, a programmatic injection seam for validation adapters
+    that build the fit upstream). At most one of the two may be set; supplying
+    both is a configuration error rather than a silent precedence choice. Either
+    way the fit flows through the same :class:`GroundPlaneProjector`.
     """
 
     camera_id: str
     #: Calibration document for this camera. ``None`` runs it uncalibrated.
     calibration_path: Path | None = None
+    #: A calibration fit built upstream, injected directly. Mutually exclusive
+    #: with ``calibration_path``. Its ``camera_id`` must match this camera.
+    calibration_fit: CalibrationFit | None = None
     #: Still or clip the integrity monitor compares live frames against.
     integrity_reference_path: Path | None = None
     #: Report drift without withholding metric output. Only meaningful with a
@@ -57,6 +69,16 @@ class VenueValidationCameraConfig:
     def __post_init__(self) -> None:
         if not self.camera_id.strip():
             raise ConfigurationError("camera_id must not be empty.")
+        if self.calibration_path is not None and self.calibration_fit is not None:
+            raise ConfigurationError(
+                f"Camera {self.camera_id!r} supplies both calibration_path and "
+                "calibration_fit; supply exactly one calibration source."
+            )
+        if self.calibration_fit is not None and self.calibration_fit.camera_id != self.camera_id:
+            raise ConfigurationError(
+                f"Camera {self.camera_id!r} was given a calibration_fit built for camera "
+                f"{self.calibration_fit.camera_id!r}."
+            )
         if self.integrity_reference_path is None and self.integrity_report_only:
             raise ConfigurationError(
                 f"Camera {self.camera_id!r} sets integrity_report_only without an "

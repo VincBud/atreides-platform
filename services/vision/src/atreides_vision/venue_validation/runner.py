@@ -154,10 +154,20 @@ class _DiscardSink:
 
 
 def _load_calibration(camera: VenueValidationCameraConfig | None) -> CalibrationFit | None:
-    """This camera's calibration, or ``None`` for an uncalibrated camera."""
-    if camera is None or camera.calibration_path is None:
+    """This camera's calibration, or ``None`` for an uncalibrated camera.
+
+    A fit injected directly (``calibration_fit``) is used as-is; a document path
+    (``calibration_path``) is loaded and solved. The config guarantees at most
+    one of the two is set. Both routes yield the same :class:`CalibrationFit`
+    and feed the same projector.
+    """
+    if camera is None:
         return None
-    return load_calibration_fit(camera.calibration_path)
+    if camera.calibration_fit is not None:
+        return camera.calibration_fit
+    if camera.calibration_path is not None:
+        return load_calibration_fit(camera.calibration_path)
+    return None
 
 
 def _build_integrity_guard(

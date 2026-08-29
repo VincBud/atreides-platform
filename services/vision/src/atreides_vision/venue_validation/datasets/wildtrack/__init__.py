@@ -40,6 +40,11 @@ Public surface
 * :mod:`.correspondence` — ground-truth-only cross-camera correspondence and
   occupancy.
 * :mod:`.inspection` — a deterministic, non-identifying dataset summary.
+* :mod:`.runtime` — the one runtime-facing seam: per-camera
+  :class:`~.runtime.WildtrackStreamSpec` frame feeds
+  (:func:`~.runtime.build_wildtrack_stream_specs`) that carry images, frame
+  identifiers, cameras and declared timing and nothing from the person-level
+  ground truth.
 """
 
 from __future__ import annotations
@@ -76,10 +81,16 @@ from atreides_vision.venue_validation.datasets.wildtrack.inspection import (
     inspect_dataset,
 )
 from atreides_vision.venue_validation.datasets.wildtrack.layout import WildtrackDatasetLayout
+from atreides_vision.venue_validation.datasets.wildtrack.runtime import (
+    WILDTRACK_DECLARED_FPS,
+    WildtrackStreamSpec,
+    build_wildtrack_stream_specs,
+)
 from atreides_vision.venue_validation.datasets.wildtrack.time import WildtrackFrameId
 
 __all__ = [
     "CAMERA_IDS",
+    "WILDTRACK_DECLARED_FPS",
     "WildtrackBoundingBox",
     "WildtrackCameraCalibration",
     "WildtrackCrossCameraCorrespondence",
@@ -93,6 +104,8 @@ __all__ = [
     "WildtrackIntrinsic",
     "WildtrackPersonAnnotation",
     "WildtrackPersonId",
+    "WildtrackStreamSpec",
+    "build_wildtrack_stream_specs",
     "calibration_name_for",
     "camera_id_for_view_num",
     "cross_camera_correspondences",
