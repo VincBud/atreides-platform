@@ -68,7 +68,9 @@ def test_a_true_cross_camera_association_is_scored_as_found_and_end_to_end() -> 
     assert result.false_merges == 0
     assert result.end_to_end_pair_count == 1
     assert result.end_to_end_satisfied_count == 1
-    assert result.evaluable_recall.value == 1.0
+    assert result.association_recall_evaluable.value == 1.0
+    assert result.association_recall_end_to_end.value == 1.0
+    assert result.fused_identity_recall_end_to_end.value == 1.0
 
 
 def test_a_wrong_merge_of_two_different_people_is_counted_as_a_false_merge() -> None:
@@ -160,7 +162,7 @@ def test_a_refused_real_pair_is_a_missed_association_with_its_reason_recorded() 
     assert result.evaluable_associated_count == 0
     assert result.missed_association_count == 1
     assert result.decision_reason_counts == {"geometry_excluded": 1}
-    assert result.evaluable_recall.value == 0.0
+    assert result.association_recall_evaluable.value == 0.0
 
 
 def test_support_not_sustained_is_tallied_on_its_own_axis() -> None:
@@ -188,7 +190,7 @@ def test_support_not_sustained_is_tallied_on_its_own_axis() -> None:
     assert result.ambiguous_pair_count == 1
 
 
-def test_missed_association_rate_is_one_minus_evaluable_recall_across_four_outcomes() -> None:
+def test_missed_association_rate_complements_association_recall_evaluable() -> None:
     pairs: list[TrackObservation] = []
     persons: list[WildtrackPersonAnnotation] = []
     decisions: list[PairDecision] = []
@@ -217,7 +219,7 @@ def test_missed_association_rate_is_one_minus_evaluable_recall_across_four_outco
     assert result.evaluable_pair_count == 4
     assert result.evaluable_associated_count == 1
     assert result.missed_association_count == 3
-    assert result.evaluable_recall.value == 0.25
+    assert result.association_recall_evaluable.value == 0.25
     assert result.missed_association_rate.value == 0.75
 
 

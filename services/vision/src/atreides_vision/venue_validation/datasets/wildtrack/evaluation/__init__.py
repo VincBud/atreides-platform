@@ -49,8 +49,14 @@ from atreides_vision.venue_validation.datasets.wildtrack.evaluation.reporting im
     WILDTRACK_EVALUATION_REPORT_FILENAME,
     WILDTRACK_EVALUATION_SCHEMA_VERSION,
     WILDTRACK_EVALUATION_SUMMARY_FILENAME,
+    WILDTRACK_FALSE_MERGE_DIAGNOSTICS_FILENAME,
+    write_false_merge_diagnostics,
     write_wildtrack_evaluation_report,
     write_wildtrack_evaluation_summary,
+)
+from atreides_vision.venue_validation.datasets.wildtrack.evaluation.scoring_run import (
+    WildtrackScoringArtifacts,
+    run_wildtrack_scoring,
 )
 
 __all__ = [
@@ -59,6 +65,7 @@ __all__ = [
     "WILDTRACK_EVALUATION_REPORT_FILENAME",
     "WILDTRACK_EVALUATION_SCHEMA_VERSION",
     "WILDTRACK_EVALUATION_SUMMARY_FILENAME",
+    "WILDTRACK_FALSE_MERGE_DIAGNOSTICS_FILENAME",
     "CameraCoverage",
     "CameraCoverageSummary",
     "CameraMatch",
@@ -72,9 +79,12 @@ __all__ = [
     "WildtrackEvaluationSummary",
     "WildtrackEvaluator",
     "WildtrackGroundTruth",
+    "WildtrackScoringArtifacts",
     "aggregate_evaluation",
     "build_camera_matches",
     "evaluate_instant",
+    "run_wildtrack_scoring",
+    "write_false_merge_diagnostics",
     "write_wildtrack_evaluation_report",
     "write_wildtrack_evaluation_summary",
 ]

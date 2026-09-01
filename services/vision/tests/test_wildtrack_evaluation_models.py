@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from atreides_vision.venue_validation.datasets.wildtrack.evaluation.models import (
     CameraCoverage,
+    InstantAssociationEvaluation,
     Ratio,
     build_camera_matches,
     mean,
@@ -111,3 +112,66 @@ def test_camera_coverage_ratios_are_null_safe() -> None:
     )
     assert coverage.runtime_coverage.value is None
     assert coverage.ground_truth_coverage.value is None
+
+
+def _association(
+    *,
+    evaluable_pair_count: int,
+    evaluable_associated_count: int,
+    end_to_end_pair_count: int,
+    end_to_end_satisfied_count: int,
+) -> InstantAssociationEvaluation:
+    return InstantAssociationEvaluation(
+        true_positive_merges=evaluable_associated_count,
+        false_merges=0,
+        unresolved_for_scoring=0,
+        evaluable_pair_count=evaluable_pair_count,
+        evaluable_associated_count=evaluable_associated_count,
+        missed_association_count=evaluable_pair_count - evaluable_associated_count,
+        ambiguous_pair_count=0,
+        support_not_sustained_count=0,
+        not_evaluable_pair_count=end_to_end_pair_count - evaluable_pair_count,
+        end_to_end_pair_count=end_to_end_pair_count,
+        end_to_end_satisfied_count=end_to_end_satisfied_count,
+        gate_reason_counts={},
+        decision_reason_counts={},
+    )
+
+
+def test_association_and_fused_identity_recall_are_separate_layers() -> None:
+    # 10 GT-positive pairs; 5 evaluable; 3 PairDecision==ASSOCIATED successes;
+    # 2 of those end up under one VenueSubjectId after fusion.
+    result = _association(
+        evaluable_pair_count=5,
+        evaluable_associated_count=3,
+        end_to_end_pair_count=10,
+        end_to_end_satisfied_count=2,
+    )
+
+    assert result.association_recall_evaluable.value == 3 / 5
+    assert result.association_recall_end_to_end.value == 3 / 10
+    assert result.fused_identity_recall_end_to_end.value == 2 / 10
+
+
+def test_changing_subject_ownership_moves_only_fused_identity_recall() -> None:
+    before = _association(
+        evaluable_pair_count=5,
+        evaluable_associated_count=3,
+        end_to_end_pair_count=10,
+        end_to_end_satisfied_count=2,
+    )
+    # Same PairDecision outcomes; one more pair now shares a VenueSubjectId.
+    after = _association(
+        evaluable_pair_count=5,
+        evaluable_associated_count=3,
+        end_to_end_pair_count=10,
+        end_to_end_satisfied_count=3,
+    )
+
+    assert after.association_recall_evaluable.value == before.association_recall_evaluable.value
+    assert after.association_recall_end_to_end.value == before.association_recall_end_to_end.value
+    assert after.fused_identity_recall_end_to_end.value == 3 / 10
+    assert (
+        after.fused_identity_recall_end_to_end.value
+        != before.fused_identity_recall_end_to_end.value
+    )

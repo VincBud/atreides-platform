@@ -413,7 +413,16 @@ class CameraCoverage:
 
 @dataclass(frozen=True, slots=True)
 class InstantAssociationEvaluation:
-    """Association scoring for one venue instant."""
+    """Association scoring for one venue instant.
+
+    Two recall axes are kept deliberately separate. The pairwise-association
+    axis (:attr:`association_recall_evaluable`, :attr:`association_recall_end_to_end`)
+    scores the explicit ``PairDecision`` outcome and shares the numerator
+    :attr:`evaluable_associated_count`. The fused-identity axis
+    (:attr:`fused_identity_recall_end_to_end`) scores a later pipeline stage —
+    whether the two tracklets ended up under one ``VenueSubjectId`` — and is
+    never called association recall.
+    """
 
     true_positive_merges: int
     false_merges: int
@@ -438,7 +447,9 @@ class InstantAssociationEvaluation:
         return Ratio.of(self.true_positive_merges, self.true_positive_merges + self.false_merges)
 
     @property
-    def evaluable_recall(self) -> Ratio:
+    def association_recall_evaluable(self) -> Ratio:
+        """Correct ``ASSOCIATED`` decisions over GT-positive pairs that were
+        *evaluable* (both endpoints locally matched, co-present)."""
         return Ratio.of(self.evaluable_associated_count, self.evaluable_pair_count)
 
     @property
@@ -450,7 +461,20 @@ class InstantAssociationEvaluation:
         return Ratio.of(self.ambiguous_pair_count, self.evaluable_pair_count)
 
     @property
-    def end_to_end_recall(self) -> Ratio:
+    def association_recall_end_to_end(self) -> Ratio:
+        """The same successful ``ASSOCIATED`` opportunities as
+        :attr:`association_recall_evaluable`, but over *all* GT-positive pairs —
+        so a pair the runtime never had a local tracklet for still counts against
+        recall. Pairwise-association layer only: it does not depend on fusion or
+        venue-local identity state."""
+        return Ratio.of(self.evaluable_associated_count, self.end_to_end_pair_count)
+
+    @property
+    def fused_identity_recall_end_to_end(self) -> Ratio:
+        """A later-stage pipeline metric, *not* association recall: over all
+        GT-positive pairs, the fraction whose two locally matched runtime
+        tracklets are members of the same ``VenueSubjectId`` after runtime
+        association / fusion / identity integration."""
         return Ratio.of(self.end_to_end_satisfied_count, self.end_to_end_pair_count)
 
     def to_record(self) -> dict[str, object]:
@@ -461,7 +485,7 @@ class InstantAssociationEvaluation:
             "association_precision": self.association_precision.to_record(),
             "evaluable_pair_count": self.evaluable_pair_count,
             "evaluable_associated_count": self.evaluable_associated_count,
-            "evaluable_recall": self.evaluable_recall.to_record(),
+            "association_recall_evaluable": self.association_recall_evaluable.to_record(),
             "missed_association_count": self.missed_association_count,
             "missed_association_rate": self.missed_association_rate.to_record(),
             "ambiguous_pair_count": self.ambiguous_pair_count,
@@ -469,8 +493,9 @@ class InstantAssociationEvaluation:
             "support_not_sustained_count": self.support_not_sustained_count,
             "not_evaluable_pair_count": self.not_evaluable_pair_count,
             "end_to_end_pair_count": self.end_to_end_pair_count,
+            "association_recall_end_to_end": self.association_recall_end_to_end.to_record(),
             "end_to_end_satisfied_count": self.end_to_end_satisfied_count,
-            "end_to_end_recall": self.end_to_end_recall.to_record(),
+            "fused_identity_recall_end_to_end": self.fused_identity_recall_end_to_end.to_record(),
             "gate_reason_counts": dict(sorted(self.gate_reason_counts.items())),
             "decision_reason_counts": dict(sorted(self.decision_reason_counts.items())),
         }
