@@ -58,6 +58,7 @@ ALLOWED_INTERNAL_PREFIXES = (
     "atreides_vision.errors",
     "atreides_vision.fusion",
     "atreides_vision.identity",
+    "atreides_vision.jsonl",
     "atreides_vision.models",
     "atreides_vision.occupancy",
     "atreides_vision.timing",
