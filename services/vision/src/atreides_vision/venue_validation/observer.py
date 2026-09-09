@@ -46,7 +46,9 @@ from atreides_vision.errors import ValidationError
 from atreides_vision.fusion.models import IntegrationResult
 from atreides_vision.identity.models import VenueSubjectId
 from atreides_vision.occupancy.models import OccupancySnapshot
+from atreides_vision.venue.models import stream_sort_key
 from atreides_vision.venue_pipeline import VenueInstantResult
+from atreides_vision.venue_validation.stage_observation import CameraStageSnapshot
 
 __all__ = [
     "VenueSubjectMembershipSnapshot",
@@ -114,6 +116,11 @@ class VenueValidationInstantSnapshot:
     unowned_tracklets: tuple[TrackletKey, ...]
     #: V0.4.6's current-occupancy snapshot for this instant, reused whole.
     occupancy: OccupancySnapshot
+    #: V0.4.10a's camera-local perception/tracking stage facts for every
+    #: contributing stream this instant, in canonical ``(camera_id,
+    #: stream_epoch)`` order. Empty unless a caller opted into observation —
+    #: never populated as a side effect of anything else this snapshot holds.
+    camera_stages: tuple[CameraStageSnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         seconds = self.venue_seconds
@@ -128,6 +135,25 @@ class VenueValidationInstantSnapshot:
                 f"venue_seconds={seconds}, round={self.association_round.venue_seconds}, "
                 f"integration={self.integration.venue_seconds}, "
                 f"occupancy={self.occupancy.venue_seconds}."
+            )
+        for stage in self.camera_stages:
+            if stage.venue_seconds != seconds:
+                raise ValidationError(
+                    "A validation instant snapshot must describe one venue instant: camera "
+                    f"stage for stream {stage.stream} has venue_seconds={stage.venue_seconds}, "
+                    f"expected {seconds}."
+                )
+        streams = [stage.stream for stage in self.camera_stages]
+        if len(set(streams)) != len(streams):
+            raise ValidationError(
+                "A validation instant snapshot cannot hold two camera stages for the same "
+                f"stream: {streams}."
+            )
+        canonical = sorted(streams, key=stream_sort_key)
+        if streams != canonical:
+            raise ValidationError(
+                "camera_stages must be in canonical (camera_id, stream_epoch) order: got "
+                f"{streams}, expected {canonical}."
             )
 
 
@@ -146,7 +172,9 @@ class VenueValidationObserver(Protocol):
 
 
 def build_instant_snapshot(
-    result: VenueInstantResult, occupancy: OccupancySnapshot
+    result: VenueInstantResult,
+    occupancy: OccupancySnapshot,
+    camera_stages: tuple[CameraStageSnapshot, ...] = (),
 ) -> VenueValidationInstantSnapshot:
     """Freeze one venue instant's runtime output into an immutable snapshot.
 
@@ -202,4 +230,5 @@ def build_instant_snapshot(
         memberships=memberships,
         unowned_tracklets=tuple(resolve(ref) for ref in occupancy.unresolved_tracklets),
         occupancy=occupancy,
+        camera_stages=camera_stages,
     )

@@ -38,7 +38,7 @@ from pathlib import Path
 from atreides_vision.association.models import AssociationOutcome, TrackObservation
 from atreides_vision.behavior.analyzer import BehaviorAnalyzer
 from atreides_vision.behavior.config import BehaviorAnalysisConfig
-from atreides_vision.behavior.coordinates import NormalizedFrameProjector
+from atreides_vision.behavior.coordinates import MotionProjector, NormalizedFrameProjector
 from atreides_vision.calibration.fitting import CalibrationFit
 from atreides_vision.calibration.integrity import (
     CalibrationIntegrityConfig,
@@ -86,6 +86,11 @@ from atreides_vision.venue_validation.observer import (
     build_instant_snapshot,
 )
 from atreides_vision.venue_validation.reporting import write_validation_summary
+from atreides_vision.venue_validation.stage_observation import (
+    CameraStageSnapshot,
+    LatestTrackingRecord,
+    build_camera_stage_snapshot,
+)
 from atreides_vision.video.processor import VideoProcessor
 from atreides_vision.video.source import (
     FileVideoSource,
@@ -130,6 +135,15 @@ class _StreamRuntime:
     behavior: BehaviorAnalyzer
     projector: GroundPlaneProjector | None
     integrity_guard: CalibrationIntegrityGuard | None
+    #: The motion projector actually driving this stream — the same
+    #: calibrated or normalized projector ``behavior`` was built with,
+    #: retained here so V0.4.10a stage observation can reuse it without a
+    #: second projector ever being constructed.
+    motion_projector: MotionProjector
+    #: Set only when a caller opts into V0.4.10a stage observation. ``None``
+    #: leaves the runtime path byte-for-byte unchanged from before this
+    #: feature existed.
+    stage_capture: LatestTrackingRecord | None = field(default=None)
     frames_processed: int = field(default=0)
     observations_emitted: int = field(default=0)
 
@@ -208,6 +222,7 @@ def _build_stream_runtime(
     fit: CalibrationFit | None,
     detector: PersonDetector,
     tracker: MultiObjectTracker,
+    observe_camera_stages: bool = False,
 ) -> _StreamRuntime:
     """Compose one stream's camera-local pipeline.
 
@@ -215,21 +230,31 @@ def _build_stream_runtime(
     stream's declared frame geometry — and kept here, because the behaviour
     analyzer exposes its space but not its projector, and
     :func:`build_track_observation` needs the projector itself.
+
+    ``observe_camera_stages`` wires a V0.4.10a :class:`LatestTrackingRecord`
+    into the same :class:`~atreides_vision.video.processor.VideoProcessor`
+    constructor call as every other injected collaborator, as its own
+    already-supported ``tracking_debug_writer`` keyword — no second hook, and
+    no change to the processor. Left ``False`` (the default), nothing new is
+    constructed and ``tracking_debug_writer`` is omitted exactly as before.
     """
     projector: GroundPlaneProjector | None = None
+    motion_projector: MotionProjector
     if fit is None:
+        motion_projector = NormalizedFrameProjector(metadata.width, metadata.height)
         behavior = BehaviorAnalyzer(
             camera_id=stream.camera_id,
-            projector=NormalizedFrameProjector(metadata.width, metadata.height),
+            projector=motion_projector,
             config=BehaviorAnalysisConfig(),
         )
     else:
         projector = GroundPlaneProjector(
             fit, frame_width=metadata.width, frame_height=metadata.height
         )
+        motion_projector = projector
         behavior = BehaviorAnalyzer(
             camera_id=stream.camera_id,
-            projector=projector,
+            projector=motion_projector,
             config=BehaviorAnalysisConfig.for_ground_plane_metres(),
         )
 
@@ -243,12 +268,14 @@ def _build_stream_runtime(
         detector=validation.detector,
         tracker=TrackerConfig(frame_rate=metadata.fps),
     )
+    stage_capture = LatestTrackingRecord() if observe_camera_stages else None
     processor = VideoProcessor(
         detector=detector,
         tracker=tracker,
         config=vision_config,
         behavior_analyzer=behavior,
         integrity_guard=guard,
+        tracking_debug_writer=stage_capture,
     )
     return _StreamRuntime(
         stream=stream,
@@ -258,6 +285,8 @@ def _build_stream_runtime(
         behavior=behavior,
         projector=projector,
         integrity_guard=guard,
+        motion_projector=motion_projector,
+        stage_capture=stage_capture,
     )
 
 
@@ -268,6 +297,7 @@ def run_venue_validation(
     tracker_factory: Callable[[TrackerConfig], MultiObjectTracker],
     source_factory: Callable[[VenueStreamEntry], VideoSource] = open_stream_source,
     observer: VenueValidationObserver | None = None,
+    observe_camera_stages: bool = False,
 ) -> VenueValidationSummary:
     """Run one venue session end to end and write its validation artifacts.
 
@@ -293,6 +323,16 @@ def run_venue_validation(
             ignored and it cannot influence the run; if it raises, the run
             fails like any other layer and writes no summary. Defaults to
             ``None`` — the runtime path is byte-for-byte unchanged without it.
+        observe_camera_stages: V0.4.10a observability only. When ``True``,
+            each snapshot handed to ``observer`` additionally carries every
+            contributing stream's camera-local perception/tracking stage
+            facts for that instant
+            (:class:`~atreides_vision.venue_validation.stage_observation.CameraStageSnapshot`).
+            Defaults to ``False``, in which case no debug capture is wired
+            into any stream's processor at all and every existing artifact —
+            association report, occupancy report, and this run's summary — is
+            byte-for-byte identical to a run compiled before this parameter
+            existed.
 
     Returns:
         The run's execution statistics. They describe what ran — never how
@@ -351,6 +391,7 @@ def run_venue_validation(
                     fit,
                     detector,
                     tracker_factory(TrackerConfig(frame_rate=metadata.fps)),
+                    observe_camera_stages=observe_camera_stages,
                 )
 
         session = VenueSession(manifest.session_id, timebase, cursors)
@@ -375,12 +416,22 @@ def run_venue_validation(
 
         for tick in session.ticks():
             observations: list[TrackObservation] = []
+            # V0.4.10a only: one CameraStageSnapshot per contributing stream,
+            # accumulated in the same already-canonical order as
+            # tick.contributions. Empty, and never even started, when
+            # observe_camera_stages is False.
+            camera_stages: list[CameraStageSnapshot] = []
             # Already canonical: VenueTick refuses to hold contributions in any
             # other order, so nothing here depends on manifest camera order.
             for frame in tick.contributions:
                 runtime = runtimes[frame.stream]
                 runtime.processor.process(frame, runtime.sink)
                 runtime.frames_processed += 1
+                if runtime.stage_capture is not None:
+                    record = runtime.stage_capture.take()
+                    camera_stages.append(
+                        build_camera_stage_snapshot(record, frame, runtime.motion_projector)
+                    )
                 observations.extend(_observations_for(runtime, frame))
 
             result = pipeline.process_instant(tick.venue_seconds, observations)
@@ -395,7 +446,9 @@ def run_venue_validation(
             # instant is final. A failure here fails the run; it never feeds
             # back into the next instant.
             if observer is not None:
-                observer(build_instant_snapshot(result, snapshot))
+                observer(
+                    build_instant_snapshot(result, snapshot, camera_stages=tuple(camera_stages))
+                )
 
             association_counts.update(decision.outcome for decision in result.round.decisions)
             integration_counts.update(outcome.outcome for outcome in result.integration.outcomes)

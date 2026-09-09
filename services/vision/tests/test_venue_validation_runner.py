@@ -33,6 +33,8 @@ from atreides_vision.venue_validation import (
     GROUND_TRUTH_STATUS,
     VenueValidationCameraConfig,
     VenueValidationConfig,
+    VenueValidationInstantSnapshot,
+    VenueValidationObserver,
     VenueValidationSummary,
     run_venue_validation,
     summary_record,
@@ -191,12 +193,17 @@ def run(
     config: VenueValidationConfig,
     sources: Mapping[Path, VideoSource],
     detector: ShapeDetector,
+    *,
+    observer: VenueValidationObserver | None = None,
+    observe_camera_stages: bool = False,
 ) -> VenueValidationSummary:
     return run_venue_validation(
         config,
         detector=detector,
         tracker_factory=lambda _config: FakeTracker(),
         source_factory=lambda entry: sources[entry.input_path],
+        observer=observer,
+        observe_camera_stages=observe_camera_stages,
     )
 
 
@@ -662,3 +669,203 @@ class TestAdapterSeam:
         text = (Path(__file__).resolve().parents[1] / source).read_text(encoding="utf-8")
         assert "build_track_observation(" in text
         assert "TrackObservation(" not in text
+
+
+class TestStageObservationSeam:
+    """V0.4.10a: observability only, default off, and never a byte of drift."""
+
+    def artifacts(self, config: VenueValidationConfig) -> dict[str, bytes]:
+        return {
+            "association": config.association_report_path.read_bytes(),
+            "occupancy": config.occupancy_report_path.read_bytes(),
+            "summary": config.summary_path.read_bytes(),
+        }
+
+    def test_observe_camera_stages_defaults_to_off(self, tmp_path: Path) -> None:
+        config, sources, detector = two_camera_setup(tmp_path, frames_a=4, frames_b=4)
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(config, sources, detector, observer=snapshots.append)
+
+        assert snapshots  # the observer really was called
+        assert all(snapshot.camera_stages == () for snapshot in snapshots)
+
+    def test_opting_in_reports_camera_stages_for_every_contributing_stream(
+        self, tmp_path: Path
+    ) -> None:
+        config, sources, detector = two_camera_setup(tmp_path, frames_a=4, frames_b=4)
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(config, sources, detector, observer=snapshots.append, observe_camera_stages=True)
+
+        assert snapshots
+        for snapshot in snapshots:
+            camera_ids = {stage.stream.camera_id for stage in snapshot.camera_stages}
+            assert camera_ids == {CAM_A, CAM_B}
+
+    def test_opting_in_changes_zero_bytes_of_the_existing_artifacts(self, tmp_path: Path) -> None:
+        """The single most important guarantee of this milestone.
+
+        Turning stage observation on must not perturb the frozen V0.4.5/
+        V0.4.6/V0.4.8 artifacts, or the summary, by even one byte — because
+        VenueValidationSummary carries no field stage observation could ever
+        touch, and the runtime pipeline itself is never altered by observing
+        it.
+        """
+        off_config, off_sources, off_detector = two_camera_setup(
+            tmp_path, output_dir=tmp_path / "off"
+        )
+        off_summary = run(off_config, off_sources, off_detector, observe_camera_stages=False)
+
+        on_config, on_sources, on_detector = two_camera_setup(tmp_path, output_dir=tmp_path / "on")
+        on_summary = run(
+            on_config,
+            on_sources,
+            on_detector,
+            observer=lambda _snapshot: None,
+            observe_camera_stages=True,
+        )
+
+        assert self.artifacts(off_config) == self.artifacts(on_config)
+        assert off_summary == on_summary
+
+    def test_public_track_ids_agree_with_this_instants_observations(self, tmp_path: Path) -> None:
+        """Every publicly reported track with a position matches an
+        observation the association engine actually saw this instant — the
+        Track -> TrackObservation invariant."""
+        config, sources, detector = two_camera_setup(tmp_path, frames_a=4, frames_b=4)
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(config, sources, detector, observer=snapshots.append, observe_camera_stages=True)
+
+        for snapshot in snapshots:
+            observation_ids = {
+                (observation.subject.camera_id, observation.subject.track_id)
+                for observation in snapshot.observations
+            }
+            for stage in snapshot.camera_stages:
+                for track in stage.tracks:
+                    if track.position is None:
+                        continue
+                    assert (stage.stream.camera_id, track.track_id) in observation_ids
+
+    def test_dedup_suppressed_detections_are_reported_but_never_tracked(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "a.mp4"
+        config = VenueValidationConfig(
+            manifest=manifest_for(VenueCamera(camera_id=CAM_A, sources=(camera_entry(path),))),
+            output_dir=tmp_path / "artifacts",
+            deduplicate_detections=True,
+            cameras=(
+                VenueValidationCameraConfig(
+                    camera_id=CAM_A,
+                    calibration_path=write_calibration(
+                        tmp_path, "cal_a.json", CAMERA_A, CAM_A, FRAME_A
+                    ),
+                ),
+            ),
+        )
+        near = detection_at(CAMERA_A, STAND)
+        duplicate = Detection(bbox_xyxy=near.bbox_xyxy, confidence=0.4, class_id=0)
+        detector = ShapeDetector({(DIMS_A[1], DIMS_A[0]): [near, duplicate]})
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(
+            config,
+            {path: source_for(*DIMS_A, 3)},
+            detector,
+            observer=snapshots.append,
+            observe_camera_stages=True,
+        )
+
+        stage = snapshots[0].camera_stages[0]
+        assert len(stage.detections) == 2
+        assert sum(1 for d in stage.detections if d.suppressed) == 1
+        assert sum(1 for d in stage.detections if not d.suppressed) == 1
+        # The tracker only ever sees what deduplication kept.
+        assert len(stage.tracks) == 1
+
+    def test_a_zero_frame_camera_produces_no_camera_stage_for_that_stream(
+        self, tmp_path: Path
+    ) -> None:
+        config, sources, detector = two_camera_setup(tmp_path, frames_a=3, frames_b=0)
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(config, sources, detector, observer=snapshots.append, observe_camera_stages=True)
+
+        for snapshot in snapshots:
+            camera_ids = {stage.stream.camera_id for stage in snapshot.camera_stages}
+            assert camera_ids == {CAM_A}
+
+    def test_an_uncalibrated_camera_reports_normalized_image_space_never_metres(
+        self, tmp_path: Path
+    ) -> None:
+        config, sources, detector = two_camera_setup(tmp_path, calibrate_b=False)
+        snapshots: list[VenueValidationInstantSnapshot] = []
+        run(config, sources, detector, observer=snapshots.append, observe_camera_stages=True)
+
+        from atreides_vision.behavior.coordinates import MotionSpace
+
+        for snapshot in snapshots:
+            for stage in snapshot.camera_stages:
+                if stage.stream.camera_id == CAM_B:
+                    assert stage.space is MotionSpace.NORMALIZED_IMAGE
+                else:
+                    assert stage.space is MotionSpace.GROUND_PLANE_METRES
+
+    def test_an_observer_failure_propagates_and_still_releases_sources(
+        self, tmp_path: Path
+    ) -> None:
+        config, sources, detector = two_camera_setup(tmp_path, frames_a=3, frames_b=3)
+
+        def exploding(_snapshot: VenueValidationInstantSnapshot) -> None:
+            raise RuntimeError("the observer refused this instant")
+
+        with pytest.raises(RuntimeError, match="the observer refused this instant"):
+            run(config, sources, detector, observer=exploding, observe_camera_stages=True)
+
+        assert all(source.released for source in sources.values())  # type: ignore[attr-defined]
+
+    def test_camera_stages_are_reported_in_canonical_stream_order_regardless_of_manifest_order(
+        self, tmp_path: Path
+    ) -> None:
+        forward_config, forward_sources, forward_detector = two_camera_setup(
+            tmp_path, order=(CAM_A, CAM_B), output_dir=tmp_path / "forward"
+        )
+        forward_snapshots: list[VenueValidationInstantSnapshot] = []
+        run(
+            forward_config,
+            forward_sources,
+            forward_detector,
+            observer=forward_snapshots.append,
+            observe_camera_stages=True,
+        )
+
+        reverse_config, reverse_sources, reverse_detector = two_camera_setup(
+            tmp_path, order=(CAM_B, CAM_A), output_dir=tmp_path / "reverse"
+        )
+        reverse_snapshots: list[VenueValidationInstantSnapshot] = []
+        run(
+            reverse_config,
+            reverse_sources,
+            reverse_detector,
+            observer=reverse_snapshots.append,
+            observe_camera_stages=True,
+        )
+
+        forward_order = [
+            [stage.stream.camera_id for stage in snapshot.camera_stages]
+            for snapshot in forward_snapshots
+        ]
+        reverse_order = [
+            [stage.stream.camera_id for stage in snapshot.camera_stages]
+            for snapshot in reverse_snapshots
+        ]
+        assert forward_order == reverse_order == [[CAM_A, CAM_B]] * len(forward_snapshots)
+
+    def test_export_surface_exposes_only_the_snapshot_types(self) -> None:
+        from atreides_vision import venue_validation
+
+        assert "CameraStageSnapshot" in venue_validation.__all__
+        assert "StageDetectionSnapshot" in venue_validation.__all__
+        assert "StageTrackSnapshot" in venue_validation.__all__
+        assert "StageTrackletSnapshot" in venue_validation.__all__
+        # Capture/builder machinery is runner-internal, not public API.
+        assert "LatestTrackingRecord" not in venue_validation.__all__
+        assert "build_camera_stage_snapshot" not in venue_validation.__all__
