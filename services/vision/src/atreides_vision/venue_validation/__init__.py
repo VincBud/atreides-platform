@@ -33,10 +33,20 @@ from atreides_vision.venue_validation.reporting import (
     write_validation_summary,
 )
 from atreides_vision.venue_validation.runner import open_stream_source, run_venue_validation
+from atreides_vision.venue_validation.stage_observation import (
+    CameraStageSnapshot,
+    StageDetectionSnapshot,
+    StageTrackletSnapshot,
+    StageTrackSnapshot,
+)
 
 __all__ = [
     "GROUND_TRUTH_STATUS",
     "VENUE_VALIDATION_SUMMARY_SCHEMA_VERSION",
+    "CameraStageSnapshot",
+    "StageDetectionSnapshot",
+    "StageTrackSnapshot",
+    "StageTrackletSnapshot",
     "VenueSubjectMembershipSnapshot",
     "VenueValidationCameraConfig",
     "VenueValidationConfig",
